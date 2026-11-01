@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2216 lines of C.
+2349 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -26,8 +26,11 @@ Flags: `-d DIR` document root (default `.`), `-p PORT` (default 8080),
 to retune the header, idle, body and write timeouts in milliseconds,
 `-R N` requests per connection before a graceful close (default 1000),
 `-A MS` maximum connection age in milliseconds (default 300000) and `-M MB`
-total budget for connection buffers (default 256; pressure earns the
-offending connection a clean 503, never a process crash).
+total budget for dynamic connection buffers - parse backlog, request
+bodies and response pages (default 256; pressure earns the offending
+connection a clean 503, never a process crash). The fixed per-connection
+struct (about 40 KB times `-c` connections) and the static file buffers
+are not charged against it.
 
 ## What it does
 
@@ -44,16 +47,23 @@ offending connection a clean 503, never a process crash).
   `If-Modified-Since` get a 304 with no body. `If-Range` gates a range on
   its validator, strictly: the exact entity-tag (a weak tag never holds)
   or a date exactly equal to Last-Modified - a future or stale date gets
-  the full 200 body. `POST /echo` stores nothing, so any `If-Match`
-  there is a 412.
+  the full 200 body. The two list headers combine when repeated
+  (`If-Match: "a"` plus `If-Match: "b"` is one list, per RFC 9110 5.3);
+  a repeated `If-Modified-Since`, `If-Unmodified-Since` or `If-Range`
+  is ambiguous, so it is a 400. Dates parse strictly: a made-up weekday
+  name or a year before 1970 means the header is ignored, never
+  rejected and never honored. `POST /echo` stores nothing, so any
+  `If-Match` there is a 412.
 - **Range requests.** A single byte range per request - `bytes=0-99`,
   `bytes=500-` or the last N bytes with `bytes=-64` - answered 206 with a
   Content-Range header; an unsatisfiable range is a 416. Unknown units,
-  malformed ranges and multi-range requests are ignored and get the full
-  200 body, as RFC 9110 permits.
+  malformed ranges, invalid specs (`bytes=-` and `bytes=-0` are invalid,
+  not unsatisfiable) and multi-range requests are ignored and get the
+  full 200 body, as RFC 9110 permits.
 - **POST /echo.** The request body comes back verbatim with its
   content-type, whether it arrived with a Content-Length or chunked
-  transfer-coding (chunk extensions and trailers included).
+  transfer-coding (chunk extensions and trailers included, though a
+  control byte in either - HTAB aside - is a 400).
   `Expect: 100-continue` gets an interim 100 only when the body will be
   accepted, the final error otherwise; any other Expect is a 417.
 - **Keep-alive and pipelining.** HTTP/1.1 connections stay open across
@@ -158,11 +168,15 @@ the request:
   one list per RFC 9110 5.3 - is ignored and the full body served).
 - An HTTP/1.1 request with an empty Host header is a 400 (the
   conservative reading of RFC 9112 3.2).
-- The -M budget bounds the request bodies and response buffers held at
-  once; a connection that would push past it gets a 503 with
-  Retry-After: 1 and closes. A malloc failure inside the budget means
-  the host itself is out of memory, which no static server survives
-  usefully - mast exits 70 then.
+- The -M budget bounds the dynamic buffers held at once: each
+  connection's parse backlog (pipelined bytes waiting their turn),
+  request body and response pages. A connection that would push past it
+  gets a 503 with Retry-After: 1 and closes. The fixed Conn struct
+  (about 40 KB per connection, so `-c 1024` carries roughly 40 MB
+  whether the budget is reached or not) and the static file buffers are
+  separate. A malloc failure inside the budget means the host itself is
+  out of memory, which no static server survives usefully - mast exits
+  70 then.
 - Graceful shutdown lets in-flight writes finish for up to 5 seconds;
   a second SIGINT/SIGTERM exits at once.
 - HTTP/1.0 and HTTP/1.1 only - no HTTP/2, no WebSockets.
@@ -171,10 +185,11 @@ the request:
 
 `make test` runs three layers:
 
-- a **312 checks** unit suite over the parser (including byte-by-byte
-  fragmented feeds), path sanitizer, ranges, dates, chunked bodies and the
+- a **326 checks** unit suite over the parser (including byte-by-byte
+  fragmented feeds and a CPU bound on a 26 KB head dribbled in one byte
+  at a time), path sanitizer, ranges, dates, chunked bodies and the
   full response pipeline against a temporary document root;
-- a **137 checks** live-socket suite that runs the real server and talks
+- a **159 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths,
@@ -192,7 +207,14 @@ the request:
   under flood, fast SIGTERM shutdown with idle keep-alive conns while
   in-flight responses complete - capped by a 5-second grace and a second
   signal that forces exit - special files (FIFO, socket, device) as fast
-  404s, blank-line floods, the memory budget refusing with 503, EMFILE
+  404s, blank-line floods, the memory budget refusing with 503 (plain
+  bodies, a chunked batch whose buffer doubling projects past it, and an
+  exact ledger across keep-alive reuse), a dribbled no-LF head never
+  blocking other clients, an 800-byte directory redirect with a
+  Content-Length that matches the delivered body byte for byte, invalid
+  suffix ranges ignored with a 200, junk dates ignored, control bytes in
+  chunk extensions and trailers refused, conditional repeats combined or
+  refused, EMFILE
   recovery, a root-document-tree server and 50 concurrent clients;
 - `tests/fuzz-sockets.py`, a stateful socket fuzzer: random mutated
   sessions with fragmentation, pipelining, half-closes, RSTs, oversized

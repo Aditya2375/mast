@@ -23,6 +23,11 @@ dd if=/dev/urandom of="$ROOT/fifty-mb.bin" bs=1048576 count=50 2>/dev/null
 # symlink fixtures: one inside the tree (served), one escaping it (refused)
 ln -s a.txt "$ROOT/link.txt"
 ln -s /etc/passwd "$ROOT/escape.txt"
+# a deep directory tree: the 301 body carries the full ~800-byte target
+DEEP="$ROOT"
+for i in $(seq 0 31); do DEEP="$DEEP/d$i-xxxxxxxxxxxxxxxxxxxx"; done
+mkdir -p "$DEEP"
+printf 'deep\n' > "$DEEP/index.html"
 
 "$BIN" -d "$ROOT" -p $PORT > "$ROOT/server.log" 2>&1 &
 SPID=$!
@@ -901,6 +906,139 @@ for sc in held:
 time.sleep(0.5)
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
 ok(status(r) == 200, "server healthy after memory pressure")
+
+# --- round 6: a chunked batch projects its buffer doubling into the -M budget ---
+# 16 held 950 KB bodies plus two 500 KB chunked fills leave ~450 KB of
+# headroom; a 100 KB follow-up batch on the first chunked connection then
+# needs a 512 KB buffer doubling it used to sneak past the check (the batch
+# is smaller than the current cap, so the old projection computed growth 0)
+held2 = []
+for k in range(16):
+    sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+    sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 950000\r\n\r\n" + b"z" * 100)
+    held2.append(sc)
+time.sleep(0.4)
+cka = socket.create_connection(("127.0.0.1", port8), timeout=8)
+cka.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+cka.sendall(b"7a120\r\n" + b"c" * 500000 + b"\r\n")
+ckb = socket.create_connection(("127.0.0.1", port8), timeout=8)
+ckb.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+ckb.sendall(b"7a120\r\n" + b"c" * 500000 + b"\r\n")
+time.sleep(0.3)
+cka.sendall(b"186a0\r\n" + b"c" * 100000)
+cka.settimeout(4)
+got = b""
+try:
+    while b"\r\n\r\n" not in got:
+        part = cka.recv(65536)
+        if not part:
+            break
+        got += part
+except socket.timeout:
+    pass
+ok(status(got) == 503, "a chunked batch projects its buffer doubling into the budget (503)")
+cka.close()
+ckb.close()
+for sc in held2:
+    sc.close()
+time.sleep(0.5)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
+ok(status(r) == 200, "server healthy after chunked budget pressure")
+
+# --- round 6: keep-alive budget accounting hands back exactly what it counted ---
+ka = socket.create_connection(("127.0.0.1", port8), timeout=10)
+ka.settimeout(10)
+seq_ok = True
+for k in range(4):
+    ka.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 900000\r\n\r\n" + b"q" * 900000)
+    got = b""
+    while True:
+        part = ka.recv(65536)
+        if not part:
+            break
+        got += part
+        if b"\r\n\r\n" in got:
+            h2, _, bdy = got.partition(b"\r\n\r\n")
+            m2 = re.search(rb"Content-Length: (\d+)", h2)
+            if m2 and len(bdy) >= int(m2.group(1)):
+                break
+    if not got.startswith(b"HTTP/1.1 200"):
+        seq_ok = False
+        break
+ok(seq_ok, "four sequential 900 KB echoes on one keep-alive connection")
+ka.close()
+time.sleep(0.3)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
+ok(status(r) == 200, "the budget ledger stays exact across keep-alive reuse")
+
+# --- round 6: a long directory redirect carries an honest Content-Length ---
+deep = "/".join("d%d-xxxxxxxxxxxxxxxxxxxx" % i for i in range(32))
+r = request(("GET /" + deep + " HTTP/1.1\r\nHost: x\r\n\r\n").encode())
+head, _, body = r.partition(b"\r\n\r\n")
+m = re.search(rb"Content-Length: (\d+)", head)
+ok(head.startswith(b"HTTP/1.1 301"), "an 800-byte directory target redirects 301")
+ok(m and int(m.group(1)) == len(body) and len(body) > 800,
+   "long 301: Content-Length exactly matches the delivered body")
+ok(("Location: /" + deep + "/").encode() in body, "long 301: the body carries the full target")
+
+# --- round 6: a byte-dribbled head must not pin the loop ---
+drib = socket.create_connection(("127.0.0.1", port), timeout=3)
+drib.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nX-Pad: ")
+drib_ok = True
+for k in range(2000):
+    drib.sendall(b"y")
+    if k % 200 == 199:
+        if not request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n").startswith(b"HTTP/1.1 200"):
+            drib_ok = False
+            break
+ok(drib_ok, "a dribbled no-LF head never blocks other clients")
+drib.sendall(b"\r\n\r\n")
+r = b""
+drib.settimeout(3)
+try:
+    while b"\r\n\r\n" not in r:
+        part = drib.recv(4096)
+        if not part:
+            break
+        r += part
+except socket.timeout:
+    pass
+ok(r.startswith(b"HTTP/1.1 200"), "the dribbled head still completes into a 200")
+drib.close()
+
+# --- round 6: invalid suffix ranges are ignored, not 416 (RFC 9110 14.2) ---
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=-\r\n\r\n")
+ok(status(r) == 200 and r.endswith(b"plain text\n"), "Range: bytes=- is ignored (200), not 416")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=-0\r\n\r\n")
+ok(status(r) == 200 and r.endswith(b"plain text\n"), "Range: bytes=-0 is ignored (200), not 416")
+
+# --- round 6: dates before the epoch or with a junk weekday are ignored ---
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 06 Nov 1955 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 200, "a pre-1970 If-Modified-Since is ignored, not 304")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: ZZZ, 06 Nov 2026 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 200, "a fake-weekday If-Modified-Since is ignored, not 304")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 06 Nov 2094 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 304, "a valid future If-Modified-Since still short-circuits")
+
+# --- round 6: control bytes in chunk extensions and trailers are refused ---
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5;a=\x01b\r\nhello\r\n0\r\n\r\n")
+ok(status(r) == 400, "a control byte in a chunk extension is 400")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Bad: \x02\r\n\r\n")
+ok(status(r) == 400, "a control byte in a trailer is 400")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5;a=ok-1\r\nhello\r\n0\r\nX-Trace: fine\r\n\r\n")
+ok(status(r) == 200 and r.endswith(b"hello"), "a clean chunk extension and trailer still pass")
+
+# --- round 6: conditional repeats: list headers combine, singletons are 400 ---
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: " + etag + b"\r\nIf-None-Match: \"other\"\r\n\r\n")
+ok(status(r) == 304, "a repeated If-None-Match combines into the list")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Match: " + etag + b"\r\nIf-Match: \"other\"\r\n\r\n")
+ok(status(r) == 200, "a repeated If-Match combines into the list")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 400, "a repeated If-Modified-Since is 400")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Unmodified-Since: Sun, 06 Nov 2094 08:49:37 GMT\r\nIf-Unmodified-Since: Sun, 06 Nov 2094 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 400, "a repeated If-Unmodified-Since is 400")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Range: " + etag + b"\r\nIf-Range: " + etag + b"\r\nRange: bytes=0-2\r\n\r\n")
+ok(status(r) == 400, "a repeated If-Range is 400")
 
 # -M validation
 p = subprocess.run([binpath, "-d", root, "-M", "5"], capture_output=True)

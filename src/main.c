@@ -22,7 +22,11 @@ static void usage(FILE *f) {
         "  -W write-ms         stalled response write (default: 30000)\n"
         "  -R requests         requests per connection, then close (default: 1000)\n"
         "  -A age-ms           max connection age (default: 300000)\n"
-        "  -M megabytes        total budget for connection buffers (default: 256)\n");
+        "  -M megabytes        total budget for dynamic connection buffers: parse\n"
+        "                          backlog, request bodies, response pages (default: 256).\n"
+        "                          The fixed per-connection struct overhead (about 40 KB\n"
+        "                          times -c connections) and static file buffers are not\n"
+        "                          charged against it.\n");
 }
 
 /* Numeric flags are strict: digits only, no sign, no leading whitespace -

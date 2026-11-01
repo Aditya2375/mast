@@ -102,17 +102,21 @@ void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse
     /* GET / HEAD */
     int st = mast_file_open(docroot_real, req, &r->file);
     if (st == 301) {
-        char body[320];
-        int n = snprintf(body, sizeof body, "301 Moved Permanently\nLocation: %s\n",
-                         r->file.redirect_to);
+        /* the body is sized from redirect_to: a long directory name must
+         * never turn snprintf's would-be length into an over-read */
+        int blen = snprintf(NULL, 0, "301 Moved Permanently\nLocation: %s\n",
+                            r->file.redirect_to);
+        if (blen < 0) blen = 0;
         mast_buf_printf(&r->head, "HTTP/1.1 301 Moved Permanently\r\n");
         char date[MAST_DATE_LEN];
         mast_http_date(date, (int64_t)time(NULL));
         mast_buf_printf(&r->head, "Date: %s\r\nServer: mast\r\nLocation: %s\r\n"
                         "Content-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\n"
                         "Connection: %s\r\n\r\n",
-                        date, r->file.redirect_to, n, ka ? "keep-alive" : "close");
-        if (req->method != MAST_METHOD_HEAD) mast_buf_put(&r->mem, body, (size_t)n);
+                        date, r->file.redirect_to, blen, ka ? "keep-alive" : "close");
+        if (req->method != MAST_METHOD_HEAD)
+            mast_buf_printf(&r->mem, "301 Moved Permanently\nLocation: %s\n",
+                            r->file.redirect_to);
         r->status = 301;
         r->close_after = !ka;
         return;

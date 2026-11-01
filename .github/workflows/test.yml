@@ -55,7 +55,13 @@ jobs:
       - uses: mymindstorm/setup-emsdk@v14
         with:
           version: 6.0.13
-      - run: sh wasm/build.sh
+      - name: rebuild the demo strictly from source
+        # deleting docs/ first proves the workflow never leans on the
+        # committed artifact: the build must regenerate it wholesale
+        run: |
+          rm -rf docs/
+          git checkout -- docs/index.html
+          sh wasm/build.sh
       - run: node tests/wasm-smoke.js
       - name: committed demo matches a fresh build
         run: git diff --exit-code --stat docs/

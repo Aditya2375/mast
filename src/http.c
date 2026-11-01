@@ -112,6 +112,14 @@ int64_t mast_parse_http_date(const char *s) {
     wday[3] = mon[3] = gmt[3] = '\0';   /* %Nc does not terminate */
     int month = month_from_name(mon);
     if (month < 0 || strcmp(gmt, "GMT") != 0) return -1;
+    /* the weekday must be a real day name ("ZZZ" is not a date), though
+     * its agreement with the actual date is not enforced - the timestamp
+     * is what a conditional compares (RFC 9110 5.6.7) */
+    static const char *wdays[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    int wd = -1;
+    for (int i = 0; i < 7; i++) if (strcmp(wday, wdays[i]) == 0) wd = i;
+    if (wd < 0) return -1;
+    if (year < 1970) return -1;   /* before the epoch: no timestamp to give */
     tmv.tm_mday = mday; tmv.tm_mon = month; tmv.tm_year = year - 1900;
     tmv.tm_hour = hour; tmv.tm_min = min; tmv.tm_sec = sec;
     tmv.tm_isdst = 0;
@@ -293,6 +301,19 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
                            MastRequest *out, size_t *consumed) {
     if (n && mast_parser_append(p, data, n, MAST_MAX_HEADERS_BYTES) != 0)
         return bad(p, "431", "the header block grew past 32 KB");
+    if (n && !memchr(data, '\n', n)) {
+        /* Without a fresh LF no line can complete, so the parse outcome is
+         * unchanged and a full re-parse from byte 0 would only burn CPU:
+         * a 27 KB head dribbled in byte by byte stays O(1) per feed
+         * instead of O(n^2) overall. The plain length caps still fire:
+         * 32 KB in mast_parser_append above, 8 KB for a first line that
+         * has no LF anywhere yet. (A feed carrying an LF runs the full
+         * parse, which also consumes any leading blank lines, so this
+         * shortcut never sees them.) */
+        if (!find_lf(p->buf, 0, p->len) && p->len > MAST_MAX_REQUEST_LINE)
+            return bad(p, "414", "the request line grew past 8 KB");
+        return MAST_PARSE_INCOMPLETE;
+    }
     memset(out, 0, sizeof *out);
     out->content_length = -1;
 
@@ -474,11 +495,49 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
                 return bad(p, "417", "only Expect: 100-continue is understood");
             out->expect_continue = 1;
         }
-        else if (name_is(np, nlen, "If-None-Match")) out->if_none_match = vp;
-        else if (name_is(np, nlen, "If-Match")) out->if_match = vp;
-        else if (name_is(np, nlen, "If-Unmodified-Since")) out->if_unmodified_since = vp;
-        else if (name_is(np, nlen, "If-Modified-Since")) out->if_modified_since = vp;
-        else if (name_is(np, nlen, "If-Range")) out->if_range = vp;
+        else if (name_is(np, nlen, "If-None-Match")) {
+            /* a repeat combines into the list (RFC 9110 5.3): join with
+             * ", " into one fresh pool copy, so the evaluation still sees
+             * every etag */
+            if (out->if_none_match) {
+                size_t pl = strlen(out->if_none_match);
+                if (out->hpool_used + pl + vlen2 + 3 > sizeof out->hpool)
+                    return bad(p, "431", "the header block grew past 32 KB");
+                char *cb = out->hpool + out->hpool_used;
+                memcpy(cb, out->if_none_match, pl);
+                cb[pl] = ','; cb[pl + 1] = ' ';
+                memcpy(cb + pl + 2, vp, vlen2 + 1);
+                out->hpool_used += pl + vlen2 + 3;
+                out->if_none_match = cb;
+            } else out->if_none_match = vp;
+        }
+        else if (name_is(np, nlen, "If-Match")) {
+            if (out->if_match) {
+                size_t pl = strlen(out->if_match);
+                if (out->hpool_used + pl + vlen2 + 3 > sizeof out->hpool)
+                    return bad(p, "431", "the header block grew past 32 KB");
+                char *cb = out->hpool + out->hpool_used;
+                memcpy(cb, out->if_match, pl);
+                cb[pl] = ','; cb[pl + 1] = ' ';
+                memcpy(cb + pl + 2, vp, vlen2 + 1);
+                out->hpool_used += pl + vlen2 + 3;
+                out->if_match = cb;
+            } else out->if_match = vp;
+        }
+        /* the date/validator singletons must not repeat: a second one
+         * would be ambiguous, not a list */
+        else if (name_is(np, nlen, "If-Unmodified-Since")) {
+            if (out->if_unmodified_since) return bad(p, "400", "two If-Unmodified-Since headers");
+            out->if_unmodified_since = vp;
+        }
+        else if (name_is(np, nlen, "If-Modified-Since")) {
+            if (out->if_modified_since) return bad(p, "400", "two If-Modified-Since headers");
+            out->if_modified_since = vp;
+        }
+        else if (name_is(np, nlen, "If-Range")) {
+            if (out->if_range) return bad(p, "400", "two If-Range headers");
+            out->if_range = vp;
+        }
         else if (name_is(np, nlen, "Range")) {
             /* a repeated Range combines into a list (RFC 9110 5.3), which
              * is a multi-range - and mast's policy for multi-range is to
@@ -556,6 +615,13 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
             }
             if (!got_line) break;   /* need more bytes */
             r->line[r->line_len - 2] = '\0';
+            /* a control byte (HTAB aside) has no place in a chunk
+             * extension or a trailer field (RFC 9112 7.1.1/7.1.2) */
+            for (const char *v = r->line; *v; v++) {
+                unsigned char uc = (unsigned char)*v;
+                if ((uc < 32 && uc != '\t') || uc == 127)
+                    return MAST_BODY_BAD;
+            }
             if (r->state == MAST_CHUNK_SIZE) {
                 /* strict: hexdigits only (no whitespace, no sign), then an
                  * optional ;extension */
@@ -641,6 +707,9 @@ void mast_reply_error(MastBuf *head, MastBuf *body, int status, const char *why,
     const char *reason = mast_reason(status);
     char text[256];
     int n = snprintf(text, sizeof text, "%d %s\n%s\n", status, reason, why);
+    /* snprintf reports the would-be length: never read past the buffer */
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof text) n = (int)sizeof text - 1;
     mast_reply_head(head, status, reason, "text/plain; charset=utf-8", n, keep_alive);
     if (extra_headers) {
         head->len -= 2;                    /* lift the blank line ... */

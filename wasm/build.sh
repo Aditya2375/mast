@@ -2,6 +2,12 @@
 # Rebuild the browser demo in docs/ (requires emsdk on PATH).
 set -e
 cd "$(dirname "$0")/.."
+# the demo directory may have been deleted to prove a from-source rebuild
+mkdir -p docs
+if [ ! -f docs/index.html ]; then
+    echo "build.sh: docs/index.html is missing - restore it (it is hand-written, not generated)" >&2
+    exit 1
+fi
 emcc -O2 -Isrc wasm/wrapper.c src/http.c src/handle.c src/files.c \
     -o docs/mast.js \
     -sEXPORTED_FUNCTIONS=_mast_boot,_mast_conn_new,_mast_conn_free,_mast_recv,_mast_out_ptr,_mast_out_len,_mast_out_drain,_mast_conn_closed,_mast_conn_requests,_malloc,_free \

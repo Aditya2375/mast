@@ -42,8 +42,9 @@ typedef enum {
 
 static int g_drainers = 0;
 
-/* Total bytes held in per-connection dynamic buffers (request bodies and
- * response heads/pages). Bounded by the -M budget: a connection that
+/* Total bytes held in per-connection dynamic buffers (parse backlog,
+ * request bodies and response heads/pages). Bounded by the -M budget: a
+ * connection that
  * would push past it gets a 503 and closes instead of growing without
  * limit, and a failed allocation fails that one connection, never the
  * process. */
@@ -76,11 +77,14 @@ typedef struct {
     long long turn_bytes;   /* written this loop pass (fairness) */
     int yielded;            /* budget spent with work pending: re-run */
     size_t dyn_counted;     /* bytes this conn added to g_dyn_bytes */
+    size_t parser_counted;  /* of parser.cap: the part already in g_dyn_bytes */
+    int head_waiting;       /* last head parse said INCOMPLETE: skip
+                             * re-parsing recv batches that hold no LF */
     struct sockaddr_in peer;
 } Conn;
 
-/* only growth through the monitored paths (request bodies and response
- * builds) is counted, and exactly that is handed back on close */
+/* only growth through the monitored paths (parse backlog, request bodies
+ * and response builds) is counted, and exactly that is handed back on close */
 static void dyn_return(Conn *c) {
     g_dyn_bytes -= c->dyn_counted;
     c->dyn_counted = 0;
@@ -138,6 +142,11 @@ static void log_access(Conn *c) {
 /* Reset per-request state for the next pipelined request on this conn. */
 static void conn_next_request(Conn *c) {
     dyn_return(c);
+    /* the parse buffer lives on across requests (pipelined bytes sit in
+     * it), so its counted bytes stay in the budget */
+    g_dyn_bytes += c->parser_counted;
+    c->dyn_counted = c->parser_counted;
+    c->head_waiting = 0;
     mast_response_free(&c->resp);
     mast_response_init(&c->resp);
     free(c->req.body);
@@ -211,6 +220,7 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
             size_t consumed = 0;
             if (c->req_start_ms == 0) c->req_start_ms = now_ms();
             MastParse r = mast_parser_feed(&c->parser, NULL, 0, &c->req, &consumed);
+            c->head_waiting = r == MAST_PARSE_INCOMPLETE;
             if (r == MAST_PARSE_INCOMPLETE) return 0;   /* wait for bytes */
             if (r == MAST_PARSE_BAD) {
                 int status = atoi(c->parser.err_status);
@@ -275,10 +285,18 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
         }
         /* body */
         if (c->req.chunked || c->req.content_length > 0) {
-            /* the feed grows the body buffer by at most this much */
-            size_t proj = c->req.chunked
-                ? c->parser.len
-                : (size_t)c->req.content_length + 1;
+            /* the feed grows the body buffer to an exact doubling target:
+             * project that target, or a batch larger than the current cap
+             * slips past the budget check (grow computes to 0) */
+            size_t proj;
+            if (c->req.chunked) {
+                size_t want = c->req.body_len + c->parser.len;
+                proj = c->req.body_cap ? c->req.body_cap : 4096;
+                while (proj < want) proj *= 2;
+                if (proj > MAST_MAX_BODY + 1) proj = MAST_MAX_BODY + 1;
+            } else {
+                proj = (size_t)c->req.content_length + 1;
+            }
             size_t grow = proj > c->req.body_cap ? proj - c->req.body_cap : 0;
             size_t old_cap = c->req.body_cap;
             if (grow && g_dyn_bytes + grow > dyn_budget(cfg)) {
@@ -402,8 +420,42 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
         c->last_ms = now_ms();
         if (c->state == CONN_READ_HEAD && c->parser.len == 0 && c->req_start_ms == 0)
             c->req_start_ms = c->last_ms;   /* the head's absolute deadline starts here */
+        /* the parse backlog counts against the -M budget: refuse the
+         * growth, not the bytes (a small batch fitting the current cap
+         * always lands, so a plain request is never rejected for this) */
+        size_t pneed = c->parser.len + (size_t)r;
+        if (pneed > c->parser.cap) {
+            size_t ptarget = c->parser.cap ? c->parser.cap : 4096;
+            while (ptarget < pneed) ptarget *= 2;
+            size_t pgrow = ptarget - c->parser.cap;
+            if (pgrow && g_dyn_bytes + pgrow > dyn_budget(cfg)) {
+                if (pending) return 1;   /* let the pending answer flush first */
+                mast_reply_error(&c->resp.head, &c->resp.mem, 503,
+                                 "the server is out of buffer room, retry shortly",
+                                 "Retry-After: 1\r\n", 0);
+                c->resp.status = 503;
+                c->resp.close_after = 1;
+                c->responding = 1;
+                c->state = CONN_WRITE;
+                return 1;
+            }
+        }
         if (mast_parser_append(&c->parser, tmp, (size_t)r, cap) != 0) return -1;
-        if (!pending) pending = conn_process(c, cfg);
+        if (c->parser.cap > c->parser_counted) {
+            g_dyn_bytes += c->parser.cap - c->parser_counted;
+            c->dyn_counted += c->parser.cap - c->parser_counted;
+            c->parser_counted = c->parser.cap;
+        }
+        /* a batch with no LF cannot complete any head line: when the last
+         * parse already said INCOMPLETE, re-parsing from byte 0 would only
+         * re-read the same bytes (an O(n^2) CPU pin under a byte-dribble).
+         * The 8 KB request-line cap is length-only, so crossing it still
+         * gets its 414 by running the parser once the buffer passes it. */
+        int has_lf = memchr(tmp, '\n', (size_t)r) != NULL;
+        if (!pending &&
+            (c->state != CONN_READ_HEAD || !c->head_waiting || has_lf ||
+             c->parser.len > MAST_MAX_REQUEST_LINE))
+            pending = conn_process(c, cfg);
     }
     return pending;
 }
@@ -564,8 +616,10 @@ int mast_serve(const MastConfig *cfg) {
                             "Content-Type: text/plain; charset=utf-8\r\n"
                             "Content-Length: %zu\r\nConnection: close\r\n\r\n%s",
                             sizeof body - 1, body);
-                        if (bl > 0)
+                        if (bl > 0) {
+                            if ((size_t)bl > sizeof busy) bl = sizeof busy;
                             (void)!send(cfd, busy, (size_t)bl, MSG_NOSIGNAL);
+                        }
                         close(cfd);
                         continue;
                     }

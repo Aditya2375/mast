@@ -80,8 +80,10 @@ int mast_range_parse(const char *header, long long size,
     if (dash != spec && range_digits(spec, dash, &a) < 0) return 0;
     if (dash[1] && range_digits(dash + 1, spec + strlen(spec), &b) < 0) return 0;
     if (a == -1) {
-        /* the last b bytes */
-        if (b <= 0) return -1;   /* "bytes=-" or "bytes=-0": unsatisfiable */
+        /* the last b bytes; "bytes=-" and "bytes=-0" are invalid specs,
+         * not unsatisfiable ones: ignore the Range and serve the whole
+         * representation (RFC 9110 14.2) */
+        if (b <= 0) return 0;
         if (b > size) b = size;
         *start = size - b;
         *len = b;

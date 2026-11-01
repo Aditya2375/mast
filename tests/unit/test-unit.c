@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int checks = 0, fails = 0;
@@ -37,6 +38,18 @@ int main(void) {
 
     CHECK(parse("HEAD /a.txt HTTP/1.0\r\n\r\n", &q, &used) == MAST_PARSE_OK, "HTTP/1.0 HEAD");
     CHECK(q.method == MAST_METHOD_HEAD && q.minor == 0 && !q.keep_alive, "1.0 closes by default");
+    /* conditional repeats: the two list headers combine; the date and
+     * If-Range singletons must not repeat */
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nIf-None-Match: \"a\"\r\nIf-None-Match: \"b\"\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && strcmp(q.if_none_match, "\"a\", \"b\"") == 0, "repeated If-None-Match combines");
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nIf-Match: \"a\"\r\nIf-Match: \"b\"\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && strcmp(q.if_match, "\"a\", \"b\"") == 0, "repeated If-Match combines");
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
+          "repeated If-Modified-Since is a 400");
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nIf-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\nIf-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
+          "repeated If-Unmodified-Since is a 400");
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nIf-Range: \"a\"\r\nIf-Range: \"b\"\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
+          "repeated If-Range is a 400");
     CHECK(parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && q.keep_alive, "1.0 keep-alive opt-in");
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &q, &used) == MAST_PARSE_OK
@@ -228,6 +241,35 @@ int main(void) {
     CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n", &q, &used)
           == MAST_PARSE_BAD, "non-chunked TE is 501");
 
+    /* ---- dribble CPU bound ----
+     * A 27 KB head fed one byte at a time: the no-LF shortcut keeps every
+     * feed O(1), so the whole head costs microseconds, not the O(n^2)
+     * re-parse from byte 0 this used to be (about 200 ms measured on an
+     * unloaded laptop before the fix; the 100 ms bound leaves wide room
+     * for slow CI). */
+    {
+        size_t hcap = 26 * 1024 + 64;
+        char *head = malloc(hcap);
+        int hn = snprintf(head, hcap, "GET / HTTP/1.1\r\nHost: x\r\nX-Pad: ");
+        memset(head + hn, 'y', 26 * 1024);
+        hn += 26 * 1024;
+        hn += snprintf(head + hn, hcap - (size_t)hn, "\r\n\r\n");
+        MastParser p;
+        mast_parser_init(&p);
+        struct timespec ta, tb;
+        clock_gettime(CLOCK_MONOTONIC, &ta);
+        MastParse pr = MAST_PARSE_INCOMPLETE;
+        for (int i = 0; i < hn; i++)
+            pr = mast_parser_feed(&p, head + i, 1, &q, &used);
+        clock_gettime(CLOCK_MONOTONIC, &tb);
+        double ms = (double)(tb.tv_sec - ta.tv_sec) * 1000.0 +
+                    (double)(tb.tv_nsec - ta.tv_nsec) / 1e6;
+        CHECK(pr == MAST_PARSE_OK, "a 26 KB head dribbled byte by byte parses");
+        CHECK(ms < 100.0, "the dribbled head parses in bounded CPU time");
+        mast_parser_free(&p);
+        free(head);
+    }
+
     /* ---- path sanitizing ---- */
     char path[MAST_MAX_TARGET];
     CHECK(mast_sanitize_path("/", path, sizeof path) && strcmp(path, "/") == 0, "root");
@@ -263,7 +305,10 @@ int main(void) {
     CHECK(mast_range_parse("BYTES=0-9", 100, &st, &ln) == 1 && ln == 10, "range unit case-insensitive");
     CHECK(mast_range_parse("bytes= 1-4", 100, &st, &ln) == 0, "range with a space ignored");
     CHECK(mast_range_parse("bytes=+1-4", 100, &st, &ln) == 0, "range with a sign ignored");
-    CHECK(mast_range_parse("bytes=-0", 100, &st, &ln) == -1, "zero suffix unsatisfiable");
+    /* an empty or zero suffix is an invalid spec, not an unsatisfiable
+     * one: the Range is ignored and the full body served (RFC 9110 14.2) */
+    CHECK(mast_range_parse("bytes=-0", 100, &st, &ln) == 0, "zero suffix ignored");
+    CHECK(mast_range_parse("bytes=-", 100, &st, &ln) == 0, "empty suffix ignored");
     CHECK(mast_range_parse("bytes=5-3", 100, &st, &ln) == -1, "last before first unsatisfiable");
     CHECK(mast_range_parse("bytes=0-99999999999999999999999", 100, &st, &ln) == 1
           && st == 0 && ln == 100, "overflowing last-byte-pos clamps to EOF (RFC 9110 14.2)");
@@ -282,6 +327,15 @@ int main(void) {
     CHECK(parse("GET /big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-9\r\nRange: bytes=20-29\r\n\r\n",
                 &q, &used) == MAST_PARSE_OK && q.range == NULL,
           "duplicate Range headers combine to a multi-range, which mast ignores");
+    /* a pre-1970 year has no timestamp to give, and a junk weekday name
+     * is not a day (a real-but-wrong weekday still parses: the timestamp
+     * is what a conditional compares, RFC 9110 5.6.7) */
+    CHECK(mast_parse_http_date("Sun, 06 Nov 1955 08:49:37 GMT") == -1,
+          "a pre-1970 date is refused");
+    CHECK(mast_parse_http_date("ZZZ, 06 Nov 1994 08:49:37 GMT") == -1,
+          "a fake weekday name is refused");
+    CHECK(mast_parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT") == 784111777,
+          "a mismatched real weekday still parses");
     CHECK(mast_parse_http_date("Tue, 31 Feb 2026 08:49:37 GMT") == -1,
           "February 31st is not a date");
     CHECK(mast_parse_http_date("Fri, 29 Feb 2036 08:49:37 GMT") != -1,
@@ -361,6 +415,44 @@ int main(void) {
         size_t cu = 0;
         CHECK(mast_body_feed(&r, &br, wire, strlen(wire), &cu) == MAST_BODY_BAD,
               "a size line past 1023 bytes is a 400");
+        free(r.body);
+    }
+    {
+        /* a control byte has no place in an extension or a trailer */
+        MastRequest r;
+        memset(&r, 0, sizeof r);
+        r.chunked = 1;
+        MastBodyReader br;
+        memset(&br, 0, sizeof br);
+        const char *wire = "5;a=\x01" "b\r\nhello\r\n0\r\n\r\n";
+        size_t cu = 0;
+        CHECK(mast_body_feed(&r, &br, wire, strlen(wire), &cu) == MAST_BODY_BAD,
+              "a control byte in a chunk extension is a 400");
+        free(r.body);
+    }
+    {
+        MastRequest r;
+        memset(&r, 0, sizeof r);
+        r.chunked = 1;
+        MastBodyReader br;
+        memset(&br, 0, sizeof br);
+        const char *wire = "5\r\nhello\r\n0\r\nX-Bad: \x02\r\n\r\n";
+        size_t cu = 0;
+        CHECK(mast_body_feed(&r, &br, wire, strlen(wire), &cu) == MAST_BODY_BAD,
+              "a control byte in a trailer is a 400");
+        free(r.body);
+    }
+    {
+        /* an HTAB stays legal (it is OWS, not a bare control byte) */
+        MastRequest r;
+        memset(&r, 0, sizeof r);
+        r.chunked = 1;
+        MastBodyReader br;
+        memset(&br, 0, sizeof br);
+        const char *wire = "5;a=\tb\r\nhello\r\n0\r\n\r\n";
+        size_t cu = 0;
+        CHECK(mast_body_feed(&r, &br, wire, strlen(wire), &cu) == MAST_BODY_OK
+              && r.body_len == 5, "an HTAB in a chunk extension passes");
         free(r.body);
     }
     {
