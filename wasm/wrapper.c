@@ -112,9 +112,20 @@ int mast_recv(DemoConn *c, const char *data, int n) {
         size_t cap = c->have_head ? (size_t)MAST_MAX_BODY + 8192 : MAST_MAX_HEADERS_BYTES;
         if (c->parser.len + slice > cap) {
             /* a response to HEAD never carries a body, even an error page;
-             * before the head parses the method is unknown, so it gets one */
-            int head413 = c->have_head && c->req.method == MAST_METHOD_HEAD;
-            mast_reply_error(&c->out, head413 ? NULL : &c->out,
+             * before the head parses, the buffered prefix still says
+             * whether a HEAD is on its way (blank-line skip, like bad()) */
+            int to_head;
+            if (c->have_head) {
+                to_head = c->req.method == MAST_METHOD_HEAD;
+            } else {
+                size_t boff = 0;
+                while (boff < c->parser.len &&
+                       (c->parser.buf[boff] == '\r' || c->parser.buf[boff] == '\n'))
+                    boff++;
+                to_head = c->parser.len - boff >= 5 &&
+                    memcmp(c->parser.buf + boff, "HEAD ", 5) == 0;
+            }
+            mast_reply_error(&c->out, to_head ? NULL : &c->out,
                 c->have_head ? 413 : 431,
                 c->have_head ? "the body grew past 1 MB"
                              : "the header block grew past 32 KB", NULL, 0);

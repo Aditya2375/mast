@@ -128,6 +128,16 @@ factory({}).then(m => {
     ok(!r.split("\r\n\r\n")[1], "wasm: the chunk 400 to a HEAD sends no body");
     }
 
+    /* round 8: the demo's pre-head 431 to a buffered HEAD prefix sends no body */
+    let hc3 = newConn();
+    r = send(hc3, "HEAD / HTTP/1.1\r\nHost: demo\r\nX-Pad: " + "a".repeat(40000) + "\r\n\r\n");
+    ok(statusOf(r) === 431, "wasm: HEAD past the header cap is a 431");
+    ok(!r.split("\r\n\r\n")[1], "wasm: the pre-head 431 to a HEAD sends no body");
+    let gc3 = newConn();
+    r = send(gc3, "GET / HTTP/1.1\r\nHost: demo\r\nX-Pad: " + "a".repeat(40000) + "\r\n\r\n");
+    ok(statusOf(r) === 431 && !!r.split("\r\n\r\n")[1],
+       "wasm: the same 431 to a GET keeps its body");
+
     c = newConn();
     r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 100000\r\n\r\n" + "y".repeat(100000));
     ok(statusOf(r) === 200 && r.endsWith("y".repeat(100)) && r.includes("Content-Length: 100000"),

@@ -209,8 +209,11 @@ int mast_file_open(const char *docroot_real, const MastRequest *req, MastFile *o
     if (S_ISDIR(st.st_mode)) {
         close(fd);
         if (req->path[strlen(req->path) - 1] != '/') {
-            /* a directory without the slash: redirect to it */
-            int n = snprintf(out->redirect_to, sizeof out->redirect_to, "%s/", req->path);
+            /* a directory without the slash: redirect to it, query intact */
+            const char *q = strchr(req->target, '?');
+            int n = q
+                ? snprintf(out->redirect_to, sizeof out->redirect_to, "%s/%s", req->path, q)
+                : snprintf(out->redirect_to, sizeof out->redirect_to, "%s/", req->path);
             if (n < 0 || (size_t)n >= sizeof out->redirect_to) { close(dfd); return 404; }
             out->is_dir = 1;
             close(dfd);

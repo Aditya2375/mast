@@ -322,6 +322,14 @@ int main(void) {
     CHECK(mast_sanitize_path("/dir/?q=1", path, sizeof path) && strcmp(path, "/dir/") == 0,
           "query stripped, trailing slash kept");
     CHECK(!mast_sanitize_path("noslash", path, sizeof path), "non-absolute target rejected");
+    {   /* round 8: the trailing-slash write must leave room for the NUL */
+        char tiny[6];
+        CHECK(!mast_sanitize_path("/abc/", tiny, 5), "trailing slash without room fails cleanly");
+        CHECK(mast_sanitize_path("/abc/", tiny, 6) == 1 && strcmp(tiny, "/abc/") == 0,
+              "trailing slash fits exactly");
+        CHECK(mast_sanitize_path("/abc", tiny, 5) == 1 && strcmp(tiny, "/abc") == 0,
+              "no trailing slash: an exact fit still passes");
+    }
 
     /* ---- containment helper ---- */
     CHECK(mast_path_beneath("/var/www/a.txt", "/var/www") == 1, "beneath: child inside");

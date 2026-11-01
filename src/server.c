@@ -99,6 +99,22 @@ static void dyn_charge_resp(Conn *c, size_t old_hcap, size_t old_mcap) {
     c->dyn_counted += grew;
 }
 
+/* Is this error going to a HEAD? In READ_BODY the head already parsed and
+ * the method answers directly; before that, the parse buffer still holds
+ * the failed head's prefix - skip any leading blank lines, mirroring
+ * bad() in http.c. A response to HEAD never carries a body, even from
+ * these pre-parser error paths. */
+static int err_to_head(const Conn *c) {
+    if (c->state == CONN_READ_BODY)
+        return c->req.method == MAST_METHOD_HEAD;
+    size_t off = 0;
+    while (off < c->parser.len &&
+           (c->parser.buf[off] == '\r' || c->parser.buf[off] == '\n'))
+        off++;
+    return c->parser.len - off >= 5 &&
+           memcmp(c->parser.buf + off, "HEAD ", 5) == 0;
+}
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) {
     (void)sig;
@@ -414,6 +430,10 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
     char tmp[16384];
     int pending = 0;
     for (;;) {
+        /* the READ_BODY arm is defensive: mast_body_feed drains the
+         * backlog into the body buffer after every batch (an unterminated
+         * chunk-size line caps at 1023 bytes inside the reader), so the
+         * backlog cannot reach this cap in practice */
         size_t cap = c->state == CONN_READ_HEAD
             ? MAST_MAX_HEADERS_BYTES
             : (size_t)MAST_MAX_BODY + 8192;
@@ -426,7 +446,7 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
              * the flood so the answer is not cut off by an RST */
             int status = c->state == CONN_READ_HEAD ? 431 : 413;
             size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
-            mast_reply_error(&c->resp.head, &c->resp.mem, status,
+            mast_reply_error(&c->resp.head, err_to_head(c) ? NULL : &c->resp.mem, status,
                 status == 431 ? "the header block grew past 32 KB"
                               : "the body grew past 1 MB", NULL, 0);
             dyn_charge_resp(c, oh, om);
@@ -459,8 +479,8 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
             if (pgrow && g_dyn_bytes + pgrow > dyn_budget(cfg)) {
                 if (pending) return 1;   /* let the pending answer flush first */
                 size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
-                mast_reply_error(&c->resp.head, &c->resp.mem, 503,
-                                 "the server is out of buffer room, retry shortly",
+                mast_reply_error(&c->resp.head, err_to_head(c) ? NULL : &c->resp.mem,
+                                 503, "the server is out of buffer room, retry shortly",
                                  "Retry-After: 1\r\n", 0);
                 dyn_charge_resp(c, oh, om);
                 c->resp.status = 503;
@@ -788,8 +808,10 @@ int mast_serve(const MastConfig *cfg) {
                  * silent connection closes quietly */
                 if (!g_stop && !c->responding && c->resp.head.len == 0 &&
                     (c->state == CONN_READ_BODY || c->parser.len > 0)) {
-                    mast_reply_error(&c->resp.head, &c->resp.mem, 408,
-                                     "the request took too long", NULL, 0);
+                    size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
+                    mast_reply_error(&c->resp.head, err_to_head(c) ? NULL : &c->resp.mem,
+                                     408, "the request took too long", NULL, 0);
+                    dyn_charge_resp(c, oh, om);
                     c->resp.status = 408;
                     c->resp.close_after = 1;
                     c->responding = 1;

@@ -10,7 +10,7 @@ PORT=18099
 PORT2=18100
 PORT3=18101
 ROOT=$(mktemp -d)
-trap 'rm -rf "$ROOT"; for p in ${SPID:-} ${SPID2:-} ${SPID3:-} ${SPID4:-} ${SPID5:-} ${SPID6:-} ${SPID7:-} ${SPID8:-}; do kill "$p" 2>/dev/null; done' EXIT
+trap 'rm -rf "$ROOT"; for p in ${SPID:-} ${SPID2:-} ${SPID3:-} ${SPID4:-} ${SPID5:-} ${SPID6:-} ${SPID7:-} ${SPID8:-} ${SPID9:-}; do kill "$p" 2>/dev/null; done' EXIT
 
 printf '<h1>hi</h1>\n' > "$ROOT/index.html"
 printf 'plain text\n' > "$ROOT/a.txt"
@@ -55,9 +55,13 @@ SPID7=$!
 PORT8=18108
 "$BIN" -d "$ROOT" -p $PORT8 -M 16 > "$ROOT/server8.log" 2>&1 &
 SPID8=$!
+# round 8: a small budget with a fast header sweep, for the 408 ledger test
+PORT9=18110
+"$BIN" -d "$ROOT" -p $PORT9 -M 16 -H 400 > "$ROOT/server9.log" 2>&1 &
+SPID9=$!
 sleep 0.4
 
-python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" "$PORT5" "$PORT6" "$PORT7" "$PORT8" "$SPID" <<'PYEOF'
+python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" "$PORT5" "$PORT6" "$PORT7" "$PORT8" "$PORT9" "$SPID" <<'PYEOF'
 import socket, sys, time, re, os
 import threading
 
@@ -71,7 +75,8 @@ port5 = int(sys.argv[7])
 port6 = int(sys.argv[8])
 port7 = int(sys.argv[9])
 port8 = int(sys.argv[10])
-spid = int(sys.argv[11])
+port9 = int(sys.argv[11])
+spid = int(sys.argv[12])
 checks = 0
 fails = 0
 
@@ -222,6 +227,14 @@ r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-En
 ok(status(r) == 400, "CL+TE smuggling is 400")
 r = request(b"GET / HTTP/1.1\r\nHost: x\r\n" + b"X-Pad: " + b"y" * 33000 + b"\r\n\r\n")
 ok(status(r) in (431, 414), "oversize headers are 431/414")
+
+# --- round 8: a pre-parser 431 to a HEAD carries no body (RFC 9110) ---
+r = request(b"HEAD / HTTP/1.1\r\nHost: x\r\n" + b"X-Pad: " + b"y" * 33000 + b"\r\n\r\n")
+ok(status(r) == 431, "HEAD past the header cap is a 431")
+ok(len(r.partition(b"\r\n\r\n")[2]) == 0, "the pre-parser 431 to a HEAD sends no body")
+r = request(b"GET / HTTP/1.1\r\nHost: x\r\n" + b"X-Pad: " + b"y" * 33000 + b"\r\n\r\n")
+ok(status(r) == 431 and len(r.partition(b"\r\n\r\n")[2]) > 0,
+   "the same 431 to a GET keeps its body")
 r = request(b"GET /" + b"z" * 3000 + b" HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 414, "oversize target is 414")
 
@@ -678,6 +691,36 @@ while True:
 ok(status(r) == 200 and b"plain text" in r, "slow-but-legitimate client under the deadline is served")
 s.close()
 
+# --- round 8: the timeout 408 to a stalled HEAD carries no body ---
+s = socket.create_connection(("127.0.0.1", port5), timeout=8)   # -H 1000
+s.sendall(b"HEAD /a.txt HTTP/1.1\r\nHost: x\r\n")
+h408 = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        h408 += chunk
+except socket.timeout:
+    pass
+ok(h408.startswith(b"HTTP/1.1 408"), "a stalled HEAD earns a 408")
+ok(len(h408.partition(b"\r\n\r\n")[2]) == 0, "the 408 to a HEAD sends no body")
+s.close()
+s = socket.create_connection(("127.0.0.1", port5), timeout=8)
+s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n")
+g408 = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        g408 += chunk
+except socket.timeout:
+    pass
+ok(g408.startswith(b"HTTP/1.1 408") and len(g408.partition(b"\r\n\r\n")[2]) > 0,
+   "the 408 to a GET keeps its body")
+s.close()
+
 # --- round 4: the per-connection request cap says close on the last one ---
 s = socket.create_connection(("127.0.0.1", port6), timeout=4)   # -R 3
 s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -972,6 +1015,115 @@ time.sleep(0.3)
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
 ok(status(r) == 200, "the budget ledger stays exact across keep-alive reuse")
 
+# --- round 8: a backlog 503 to a buffered HEAD prefix carries no body ---
+# sized bodies fill the 16 MB budget to a ~6 KB headroom (each held
+# connection charges its 4 KB parser buffer plus content_length + 1):
+# the first 4 KB of a fresh head still fits, its next doubling does not
+held3 = []
+for k in range(15):
+    sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+    sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1048575\r\n\r\n" + b"z" * 100)
+    held3.append(sc)
+sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 977024\r\n\r\n" + b"z" * 100)
+held3.append(sc)
+time.sleep(0.4)
+hc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+hc.sendall(b"HEAD /a.txt HTTP/1.1\r\nHost: x\r\n")
+time.sleep(0.3)   # the first batch must land (and stay buffered) on its own
+hc.sendall(b"X-Pad: " + b"a" * 5000)
+h503 = b""
+hc.settimeout(8)
+try:
+    while True:
+        chunk = hc.recv(65536)
+        if not chunk:
+            break
+        h503 += chunk
+except socket.timeout:
+    pass
+ok(h503.startswith(b"HTTP/1.1 503"), "budget pressure earns the buffered head a 503")
+ok(len(h503.partition(b"\r\n\r\n")[2]) == 0, "the backlog 503 to a HEAD sends no body")
+hc.close()
+time.sleep(0.5)   # the closed connection hands its buffers back first
+gc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+gc.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n")
+time.sleep(0.3)
+gc.sendall(b"X-Pad: " + b"a" * 5000)
+g503 = b""
+gc.settimeout(8)
+try:
+    while True:
+        chunk = gc.recv(65536)
+        if not chunk:
+            break
+        g503 += chunk
+except socket.timeout:
+    pass
+ok(g503.startswith(b"HTTP/1.1 503") and len(g503.partition(b"\r\n\r\n")[2]) > 0,
+   "the same backlog 503 to a GET keeps its body")
+gc.close()
+for sc in held3:
+    sc.close()
+time.sleep(0.5)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
+ok(status(r) == 200, "server healthy after the backlog-503 pair")
+
+# --- round 8: the 408 path charges its response to the -M ledger ---
+# 24 stalled heads each grow a 408 response; once they close, the ledger
+# must be exactly whole again: a fill sized to the byte still fits, and
+# one connection more is refused
+stall = []
+for k in range(24):
+    sc = socket.create_connection(("127.0.0.1", port9), timeout=8)
+    sc.sendall(b"HEAD /a.txt HTTP/1.1\r\nHost: x\r\n")
+    stall.append(sc)
+n408 = 0
+for sc in stall:
+    sc.settimeout(8)
+    d = b""
+    try:
+        while True:
+            chunk = sc.recv(65536)
+            if not chunk:
+                break
+            d += chunk
+    except socket.timeout:
+        pass
+    if d.startswith(b"HTTP/1.1 408") and len(d.partition(b"\r\n\r\n")[2]) == 0:
+        n408 += 1
+    sc.close()
+ok(n408 == 24, f"24 stalled HEADs each get a bodyless 408 ({n408}/24)")
+time.sleep(0.5)
+held4 = []
+for k in range(15):
+    sc = socket.create_connection(("127.0.0.1", port9), timeout=8)
+    sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1048575\r\n\r\n" + b"z" * 100)
+    held4.append(sc)
+sc = socket.create_connection(("127.0.0.1", port9), timeout=8)
+sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 977024\r\n\r\n" + b"z" * 100)
+held4.append(sc)
+time.sleep(0.4)
+x = socket.create_connection(("127.0.0.1", port9), timeout=8)
+x.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 900000\r\n\r\n" + b"z" * 100)
+x.settimeout(8)
+xr = b""
+try:
+    while b"\r\n\r\n" not in xr:
+        part = x.recv(65536)
+        if not part:
+            break
+        xr += part
+except socket.timeout:
+    pass
+ok(status(xr) == 503, "after the 408 storm the exact-fit fill holds: one more body is 503")
+x.close()
+for sc in held4:
+    sc.close()
+time.sleep(0.5)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port9)
+ok(status(r) == 200, "server healthy after the 408 ledger storm")
+
 # --- round 6: a long directory redirect carries an honest Content-Length ---
 deep = "/".join("d%d-xxxxxxxxxxxxxxxxxxxx" % i for i in range(32))
 r = request(("GET /" + deep + " HTTP/1.1\r\nHost: x\r\n\r\n").encode())
@@ -981,6 +1133,12 @@ ok(head.startswith(b"HTTP/1.1 301"), "an 800-byte directory target redirects 301
 ok(m and int(m.group(1)) == len(body) and len(body) > 800,
    "long 301: Content-Length exactly matches the delivered body")
 ok(("Location: /" + deep + "/").encode() in body, "long 301: the body carries the full target")
+
+# --- round 8: the directory 301 keeps the query string ---
+r = request(b"GET /sub?x=1&y=2 HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 301 and b"Location: /sub/?x=1&y=2\r\n" in r, "the 301 keeps the query string")
+r = request(b"GET /sub HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 301 and b"Location: /sub/\r\n" in r, "the 301 without a query stays bare")
 
 # --- round 6: a byte-dribbled head must not pin the loop ---
 drib = socket.create_connection(("127.0.0.1", port), timeout=3)
@@ -1159,7 +1317,7 @@ sys.exit(fails)
 PYEOF
 RC=$?
 ok_stop=1
-for v in SPID SPID2 SPID3 SPID4 SPID5 SPID6 SPID7 SPID8; do
+for v in SPID SPID2 SPID3 SPID4 SPID5 SPID6 SPID7 SPID8 SPID9; do
   eval "p=\$$v"
   kill -TERM "$p" 2>/dev/null
   n=0

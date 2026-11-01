@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2433 lines of C.
+2460 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -35,8 +35,8 @@ are not charged against it.
 ## What it does
 
 - **Static files.** GET and HEAD over a document root, `index.html` for
-  directories, a 301 redirect when a directory URL lacks its trailing slash,
-  and a content-type table for the common text, image, font, audio, video
+  directories, a 301 redirect when a directory URL lacks its trailing slash
+  (the query string rides along), and a content-type table for the common text, image, font, audio, video
   and archive types.
 - **Conditional requests.** Every file carries a strong ETag
   (`"inode-size-seconds-nanoseconds"`, so a same-second same-size rewrite
@@ -86,8 +86,15 @@ are not charged against it.
   writing - up to a 5-second grace cap, so one non-reading client cannot
   hold the process hostage; a second signal exits at once.
 - **OPTIONS and absolute-form.** `OPTIONS *` and `OPTIONS /any/path`
-  answer 204 with the same Allow list; `GET http://host/path` serves its
-  path, and a 400 when the authority and the Host header disagree.
+  answer 204 with the same Allow list (conditional headers are ignored
+  there - OPTIONS describes the server, not a representation);
+  `GET http://host/path` serves its path, and a 400 when the authority
+  and the Host header disagree.
+- **HEAD stays bodyless.** A response to HEAD never carries a body - not
+  even an error page, and not even when the error fires before the parser
+  ran: the header-cap 431, the budget 503 and the stall 408 judge the
+  method from the failed head's buffered prefix. The Content-Length still
+  reports what a GET would have received.
 - **Access log.** One line per request on stdout: peer, method, target,
   status, bytes - with control bytes escaped as \xNN so a hostile request
   cannot inject terminal escapes or fake log lines.
@@ -189,13 +196,13 @@ the request:
 
 `make test` runs three layers:
 
-- a **341 checks** unit suite over the parser (including byte-by-byte
+- a **344 checks** unit suite over the parser (including byte-by-byte
   fragmented feeds and a CPU bound on a 26 KB head dribbled in one byte
   at a time through the library feed API - the socket server's side of
   the same guarantee is tested live, below), path sanitizer, ranges,
   dates, chunked bodies and the full response pipeline against a
   temporary document root;
-- a **176 checks** live-socket suite that runs the real server and talks
+- a **191 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths,
@@ -224,7 +231,11 @@ the request:
   five ignored, junk dates ignored, control bytes (NUL included) in
   chunk extensions and trailers refused, conditional repeats combined or
   refused, a differing repeated Expect refused, error responses charged
-  to the memory budget and handed back, EMFILE
+  to the memory budget and handed back, bodyless error pages to HEAD
+  from the pre-parser paths (a capped flood's 431, a budget 503 over a
+  buffered head prefix, a stalled head's 408), a 408-response budget
+  ledger probed with an exact-fit fill, a directory 301 keeping its
+  query string, EMFILE
   recovery, a root-document-tree server and 50 concurrent clients;
 - `tests/fuzz-sockets.py`, a stateful socket fuzzer: random mutated
   sessions with fragmentation, pipelining, half-closes, RSTs, oversized

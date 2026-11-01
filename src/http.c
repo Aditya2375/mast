@@ -213,8 +213,10 @@ int mast_sanitize_path(const char *target, char *out, size_t out_cap) {
     }
     /* preserve a trailing slash from the source: it marks a directory
      * request, and strtok_r swallowed the empty final segment */
-    if (trailing_slash && (o == 0 || out[o - 1] != '/'))
+    if (trailing_slash && (o == 0 || out[o - 1] != '/')) {
+        if (o + 1 >= out_cap) { free(dec); return 0; }   /* slash + NUL must fit */
         out[o++] = '/';
+    }
     free(dec);
     if (o == 0) out[o++] = '/';
     out[o] = '\0';
