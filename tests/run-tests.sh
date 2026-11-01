@@ -21,6 +21,12 @@ mkdir "$ROOT/my dir"
 printf 'space index\n' > "$ROOT/my dir/index.html"
 mkdir "$ROOT/%dir"
 printf 'percent index\n' > "$ROOT/%dir/index.html"
+# 8 nested directories with 90-byte UTF-8 names: the decoded path
+# re-encodes to ~2.2 KB, past the old 2064-byte redirect buffer
+UNID="$ROOT"
+for i in $(seq 1 8); do UNID="$UNID/$(printf 'é%.0s' $(seq 1 45))"; done
+mkdir -p "$UNID"
+printf 'unicode dir\n' > "$UNID/index.html"
 dd if=/dev/urandom of="$ROOT/big.bin" bs=1024 count=256 2>/dev/null
 head -c 2000000 /dev/urandom > "$ROOT/two-mb.bin" 2>/dev/null || dd if=/dev/urandom of="$ROOT/two-mb.bin" bs=1024 count=2000 2>/dev/null
 # too big to fit in kernel socket buffers: mid-transfer truncation is testable
@@ -1367,6 +1373,16 @@ r = request(b"GET /my%20dir?x=1&y=2 HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 301 and b"Location: /my%20dir/?x=1&y=2\r\n" in r, "the encoded 301 keeps the wire query")
 r = request(b"GET /my%20dir/ HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 200 and b"space index" in r, "the decoded space directory serves its index")
+
+# --- round 14: a raw-UTF-8 directory path redirects, re-encoded, at depth ---
+uni = "/".join(["\u00e9" * 45] * 8)
+r = request(("GET /" + uni + " HTTP/1.1\r\nHost: x\r\n\r\n").encode("utf-8"))
+head, _, _ = r.partition(b"\r\n\r\n")
+ok(head.startswith(b"HTTP/1.1 301"), "a raw-UTF-8 directory path redirects 301, never 404")
+exp = ("Location: /" + "/".join(["%C3%A9" * 45] * 8) + "/\r\n").encode()
+ok(exp in head, "the 2 KB UTF-8 redirect Location is fully percent-encoded")
+r = request(("GET /" + uni + "/ HTTP/1.1\r\nHost: x\r\n\r\n").encode("utf-8"))
+ok(status(r) == 200 and b"unicode dir" in r, "the UTF-8 directory serves its index with the slash")
 
 # --- round 6: a byte-dribbled head must not pin the loop ---
 drib = socket.create_connection(("127.0.0.1", port), timeout=3)

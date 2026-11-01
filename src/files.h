@@ -16,7 +16,11 @@ typedef struct {
     char last_modified[MAST_DATE_LEN];   /* HTTP-date */
     const char *mime;
     int is_dir;               /* path is a directory: redirect to /index */
-    char redirect_to[MAST_MAX_TARGET + 16];   /* set when is_dir needs a slash */
+    /* set when is_dir needs a slash. The decoded path re-encodes to at
+     * most 3x its wire bytes (a raw high byte becomes %XX), and the path
+     * plus query never exceed the target cap, so 3x plus slack makes the
+     * build_redirect overflow path unreachable */
+    char redirect_to[3 * MAST_MAX_TARGET + 16];
 } MastFile;
 
 /* Resolve req->path under docroot. Returns an HTTP status: 200 with fd

@@ -852,8 +852,19 @@ int mast_serve(const MastConfig *cfg) {
                         free(c);
                         continue;
                     }
+                    int slot = -1;
                     for (int k = 0; k < cfg->max_conn; k++)
-                        if (!conns[k]) { conns[k] = c; break; }
+                        if (!conns[k]) { slot = k; break; }
+                    if (slot < 0) {
+                        /* nconn and conns[] desynced (defense in depth -
+                         * no live path found): drop the connection rather
+                         * than leak an epoll-registered Conn nothing owns */
+                        epoll_ctl(ep, EPOLL_CTL_DEL, cfd, NULL);
+                        conn_free(c);
+                        free(c);
+                        continue;
+                    }
+                    conns[slot] = c;
                     nconn++;
                 }
                 continue;

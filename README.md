@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2696 lines of C.
+2711 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -60,12 +60,17 @@ are not charged against it.
   29-byte IMF-fixdate shape with zero-padded unsigned fields: a made-up
   weekday name, a sign, a lone digit or a year before 1970 means the
   header is ignored, never rejected and never honored. `POST /echo` stores nothing, so any
-  `If-Match` there is a 412.
+  `If-Match` there is a 412, while `If-None-Match` and
+  `If-Unmodified-Since` are ignored: with no stored representation there
+  is nothing for them to be fresh or stale against, so the echo simply
+  answers.
 - **Range requests.** A single byte range per request - `bytes=0-99`,
   `bytes=500-` or the last N bytes with `bytes=-64` - answered 206 with a
   Content-Range header; an unsatisfiable range is a 416. A suffix range
   on an empty file is 416 too - no byte exists to satisfy it (RFC 9110
-  14.2 leaves the choice to implementations). Unknown units,
+  14.2 leaves the choice to implementations). A range that happens to
+  cover the whole file (`bytes=0-11` on a 12-byte file) stays a 206
+  rather than collapsing into a 200 - RFC-legal, and one code path. Unknown units,
   malformed ranges, invalid specs (`bytes=-` and `bytes=-0` are invalid,
   not unsatisfiable) and multi-range requests are ignored and get the
   full 200 body, as RFC 9110 permits. A last-byte-pos before the first
@@ -171,7 +176,10 @@ the request:
 - **Request-smuggling guards.** Conflicting Content-Length headers
   (identical repeats merge, as RFC 9110 8.6 permits), a Content-Length
   alongside Transfer-Encoding, and any Transfer-Encoding other than
-  `chunked` are rejected before the body is read; a required `Expect` the
+  `chunked` are rejected before the body is read - transfer-coding
+  parameters included: `chunked;foo=bar` is a 501 even though RFC 9110
+  10.1.4 permits parameters, a deliberate rejection since no coding mast
+  knows defines any; a required `Expect` the
   server cannot meet is a 417. Bare-LF request heads are tolerated (RFC
   9112 2.2), while chunk framing stays CRLF-strict. A syntactically valid
   but unknown method - `get`, `brew` - is a 405 with an Allow list, never
@@ -216,8 +224,8 @@ the request:
   refusal machinery itself: a connection already at the wall still gets
   its small 408/431/503 error page written, so a connection can exceed
   the budget by one error page before it closes. The fixed Conn struct
-  (about 49 KB per connection - the request, response,
-  body-reader and parser structs alone are 49152 bytes) is calloc'd
+  (about 52 KB per connection - the request, response,
+  body-reader and parser structs alone are 53248 bytes) is calloc'd
   lazily as connections arrive, up to roughly 50 MB at `-c 1024`; it and
   the static file buffers are separate from the budget. A malloc failure inside the budget means the host itself is
   out of memory, which no static server survives usefully - mast exits
@@ -236,7 +244,7 @@ the request:
   the same guarantee is tested live, below), path sanitizer, ranges,
   dates, chunked bodies and the full response pipeline against a
   temporary document root;
-- a **221 checks** live-socket suite that runs the real server and talks
+- a **224 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths
