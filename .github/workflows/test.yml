@@ -33,7 +33,9 @@ jobs:
           make EXTRA="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" build/test-fuzz
           UBSAN_OPTIONS=halt_on_error=1 python3 tests/fuzz.py --programs 50 --blobs 300
       - name: stateful socket fuzz (live server, random sessions)
-        run: python3 tests/fuzz-sockets.py --sessions 60 --seed 20261201
+        run: |
+          make build/mast
+          python3 tests/fuzz-sockets.py --sessions 60 --seed 20261201
       - name: stateful socket fuzz under sanitizers
         run: |
           make EXTRA="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" build/mast
