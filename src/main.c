@@ -21,7 +21,8 @@ static void usage(FILE *f) {
         "  -B body-ms          time to finish a request body (default: 30000)\n"
         "  -W write-ms         stalled response write (default: 30000)\n"
         "  -R requests         requests per connection, then close (default: 1000)\n"
-        "  -A age-ms           max connection age (default: 300000)\n");
+        "  -A age-ms           max connection age (default: 300000)\n"
+        "  -M megabytes        total budget for connection buffers (default: 256)\n");
 }
 
 /* Numeric flags are strict: digits only, no sign, no leading whitespace -
@@ -38,9 +39,9 @@ int main(int argc, char **argv) {
     int port = 8080;
     int max_conn = 1024;
     int header_ms = 10000, idle_ms = 15000, body_ms = 30000, write_ms = 30000;
-    int max_req = 1000, max_age = 300000;
+    int max_req = 1000, max_age = 300000, mem_mb = 256;
     int opt;
-    while ((opt = getopt(argc, argv, "d:p:c:H:I:B:W:R:A:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:p:c:H:I:B:W:R:A:M:h")) != -1) {
         char *endp = NULL;
         switch (opt) {
         case 'd': docroot = optarg; break;
@@ -103,6 +104,19 @@ int main(int argc, char **argv) {
             }
             break;
         }
+        case 'M': {
+            if (!all_digits(optarg)) {
+                fprintf(stderr, "mast: -M is 16-65536 megabytes\n");
+                return 2;
+            }
+            long v = strtol(optarg, &endp, 10);
+            if (!endp || *endp || v < 16 || v > 65536) {
+                fprintf(stderr, "mast: -M is 16-65536 megabytes\n");
+                return 2;
+            }
+            mem_mb = (int)v;
+            break;
+        }
         case 'h': usage(stdout); return 0;
         default: usage(stderr); return 2;
         }
@@ -127,6 +141,7 @@ int main(int argc, char **argv) {
         .body_timeout_ms = body_ms,
         .max_requests = max_req,
         .max_age_ms = max_age,
+        .mem_budget_mb = mem_mb,
     };
     return mast_serve(&cfg);
 }

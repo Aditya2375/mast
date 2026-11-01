@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2054 lines of C.
+2216 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -24,8 +24,10 @@ curl -i -X POST --data 'hello' http://localhost:8080/echo
 Flags: `-d DIR` document root (default `.`), `-p PORT` (default 8080),
 `-c N` maximum simultaneous connections (default 1024), `-H`/`-I`/`-B`/`-W`
 to retune the header, idle, body and write timeouts in milliseconds,
-`-R N` requests per connection before a graceful close (default 1000) and
-`-A MS` maximum connection age in milliseconds (default 300000).
+`-R N` requests per connection before a graceful close (default 1000),
+`-A MS` maximum connection age in milliseconds (default 300000) and `-M MB`
+total budget for connection buffers (default 256; pressure earns the
+offending connection a clean 503, never a process crash).
 
 ## What it does
 
@@ -68,8 +70,9 @@ to retune the header, idle, body and write timeouts in milliseconds,
   sendfile for file bodies - the kernel moves bytes from page cache to
   socket without a userspace copy.
 - **Graceful shutdown.** SIGINT/SIGTERM stop accepting, close idle
-  keep-alive connections immediately, let in-flight responses finish
-  writing, and close.
+  keep-alive connections immediately, and let in-flight responses finish
+  writing - up to a 5-second grace cap, so one non-reading client cannot
+  hold the process hostage; a second signal exits at once.
 - **OPTIONS and absolute-form.** `OPTIONS *` and `OPTIONS /any/path`
   answer 204 with the same Allow list; `GET http://host/path` serves its
   path, and a 400 when the authority and the Host header disagree.
@@ -83,7 +86,10 @@ Every cap below is enforced while parsing, before any memory is committed to
 the request:
 
 - an 8 KB request line and 32 KB of headers in total,
-- at most 64 headers per request,
+- at most 64 headers per request, at most 8 empty lines before the
+  request (RFC 9112 3.5 asks a server to tolerate one), chunk-size lines
+  of 1023 bytes and trailer lines of 4094 (room for long chunk
+  extensions),
 - a request target of at most 2047 bytes (the 2048th byte is a 414),
 - a 1 MB request body (413 past that, for both Content-Length and chunked),
 - every phase has two clocks: a stall timeout refreshed by real
@@ -134,26 +140,41 @@ the request:
   request and age caps close even a perfectly behaved connection.
 - **No directory leaks.** An unreadable or missing file is the same 404, so
   the response never reveals what exists on disk.
+- **Only regular files are served.** Every open carries O_NONBLOCK and
+  the result must pass S_ISREG, so a FIFO, socket or device node in the
+  docroot is a fast 404 - it can never block the single-threaded loop on
+  open. If openat2 is missing or a seccomp filter blocks it (ENOSYS,
+  EPERM, EINVAL), the realpath fallback takes over.
 
 ## Honest limits
 
 - Linux only - the event loop is epoll, file bodies use sendfile, and
-  containment uses openat2 (with a realpath fallback on older kernels).
+  containment uses openat2 (with the realpath fallback above).
 - No TLS. Put mast behind a TLS-terminating proxy if you need HTTPS.
 - Single process, single thread. One core serves everything.
 - No virtual hosts, no content negotiation, no compression, no CGI.
 - One range per request; multipart/byteranges is not implemented (a
-  multi-range header is ignored and the full body served).
+  multi-range header - including two Range headers, which combine into
+  one list per RFC 9110 5.3 - is ignored and the full body served).
+- An HTTP/1.1 request with an empty Host header is a 400 (the
+  conservative reading of RFC 9112 3.2).
+- The -M budget bounds the request bodies and response buffers held at
+  once; a connection that would push past it gets a 503 with
+  Retry-After: 1 and closes. A malloc failure inside the budget means
+  the host itself is out of memory, which no static server survives
+  usefully - mast exits 70 then.
+- Graceful shutdown lets in-flight writes finish for up to 5 seconds;
+  a second SIGINT/SIGTERM exits at once.
 - HTTP/1.0 and HTTP/1.1 only - no HTTP/2, no WebSockets.
 
 ## Testing
 
 `make test` runs three layers:
 
-- a **290 checks** unit suite over the parser (including byte-by-byte
+- a **312 checks** unit suite over the parser (including byte-by-byte
   fragmented feeds), path sanitizer, ranges, dates, chunked bodies and the
   full response pipeline against a temporary document root;
-- a **113 checks** live-socket suite that runs the real server and talks
+- a **137 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths,
@@ -169,11 +190,14 @@ the request:
   beating a longer idle timeout, a flooding peer failing to pin the
   lingering-close drain, a 503 at the connection cap, pipelining fairness
   under flood, fast SIGTERM shutdown with idle keep-alive conns while
-  in-flight responses complete, EMFILE recovery, a root-document-tree
-  server and 50 concurrent clients;
+  in-flight responses complete - capped by a 5-second grace and a second
+  signal that forces exit - special files (FIFO, socket, device) as fast
+  404s, blank-line floods, the memory budget refusing with 503, EMFILE
+  recovery, a root-document-tree server and 50 concurrent clients;
 - `tests/fuzz-sockets.py`, a stateful socket fuzzer: random mutated
-  sessions with fragmentation, pipelining, half-closes and RSTs against
-  the live server, asserting it never crashes and still answers cleanly
+  sessions with fragmentation, pipelining, half-closes, RSTs, oversized
+  header blocks, all-at-once floods and concurrent bursts against the
+  live server, asserting it never crashes and still answers cleanly
   after the storm;
 - `tests/check-docs.sh`, which pins this README's numbers and limits to the
   code that enforces them.

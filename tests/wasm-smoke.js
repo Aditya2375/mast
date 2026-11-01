@@ -153,6 +153,34 @@ factory({}).then(m => {
        "wasm: Expect rejected with 404 says Connection: close");
 
     c = newConn();
+    r = send(c, "CONNECT x:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    ok(statusOf(r) === 405 && r.includes("Allow: GET, HEAD, POST, OPTIONS"), "wasm: CONNECT is 405 + Allow");
+
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked,\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    ok(statusOf(r) === 200 && r.endsWith("hello"), "wasm: Transfer-Encoding trailing comma tolerated");
+
+    c = newConn();
+    r = send(c, "GET / HTTP/1.1\r\nHost:\r\n\r\n");
+    ok(statusOf(r) === 400, "wasm: empty Host is a 400");
+
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.0\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n");
+    ok(statusOf(r) === 200 && r.includes("Connection: close"), "wasm: HTTP/1.0 close beats keep-alive");
+
+    c = newConn();
+    r = send(c, "GET /big.txt HTTP/1.1\r\nHost: demo\r\nRange: bytes=0-9\r\nRange: bytes=20-29\r\n\r\n");
+    ok(statusOf(r) === 200, "wasm: duplicate Range serves the full body");
+
+    c = newConn();
+    r = send(c, "\n\n\n\n\n\n\n\n\nGET / HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok(statusOf(r) === 400, "wasm: a flood of empty lines is a 400");
+
+    c = newConn();
+    r = send(c, "\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok(statusOf(r) === 200, "wasm: two empty lines tolerated");
+
+    c = newConn();
     r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello");
     ok(statusOf(r) === 200 && r.endsWith("hello"), "wasm: identical duplicate Content-Length merges");
     c = newConn();

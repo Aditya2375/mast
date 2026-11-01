@@ -10,7 +10,7 @@ PORT=18099
 PORT2=18100
 PORT3=18101
 ROOT=$(mktemp -d)
-trap 'rm -rf "$ROOT"; for p in ${SPID:-} ${SPID2:-} ${SPID3:-} ${SPID4:-} ${SPID5:-} ${SPID6:-} ${SPID7:-}; do kill "$p" 2>/dev/null; done' EXIT
+trap 'rm -rf "$ROOT"; for p in ${SPID:-} ${SPID2:-} ${SPID3:-} ${SPID4:-} ${SPID5:-} ${SPID6:-} ${SPID7:-} ${SPID8:-}; do kill "$p" 2>/dev/null; done' EXIT
 
 printf '<h1>hi</h1>\n' > "$ROOT/index.html"
 printf 'plain text\n' > "$ROOT/a.txt"
@@ -46,9 +46,13 @@ SPID6=$!
 PORT7=18107
 "$BIN" -d "$ROOT" -p $PORT7 -A 2000 -I 30000 > "$ROOT/server7.log" 2>&1 &
 SPID7=$!
+# round 5: a small memory budget, for the 503-on-pressure test
+PORT8=18108
+"$BIN" -d "$ROOT" -p $PORT8 -M 16 > "$ROOT/server8.log" 2>&1 &
+SPID8=$!
 sleep 0.4
 
-python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" "$PORT5" "$PORT6" "$PORT7" <<'PYEOF'
+python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" "$PORT5" "$PORT6" "$PORT7" "$PORT8" <<'PYEOF'
 import socket, sys, time, re, os
 import threading
 
@@ -61,6 +65,7 @@ binpath = os.path.abspath(sys.argv[6])
 port5 = int(sys.argv[7])
 port6 = int(sys.argv[8])
 port7 = int(sys.argv[9])
+port8 = int(sys.argv[10])
 checks = 0
 fails = 0
 
@@ -738,6 +743,169 @@ fa.close()
 for h in holders:
     h.close()
 
+# --- round 5: a FIFO, a unix socket or a device in the docroot is a fast
+# 404, never a blocked open ---
+import stat as statmod
+os.mkfifo(os.path.join(root, "pipe.fifo"))
+usock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+usock.bind(os.path.join(root, "sock.sock"))
+t0 = time.time()
+r = request(b"GET /pipe.fifo HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 404 and time.time() - t0 < 2, "a FIFO in the docroot is a fast 404")
+t0 = time.time()
+r = request(b"GET /sock.sock HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 404 and time.time() - t0 < 2, "a unix socket in the docroot is a fast 404")
+t0 = time.time()
+r = request(b"GET /dev/null HTTP/1.1\r\nHost: x\r\n\r\n", to=port2)
+ok(status(r) == 404 and time.time() - t0 < 2, "a device node is a fast 404")
+t0 = time.time()
+r = request(b"GET /dev/zero HTTP/1.1\r\nHost: x\r\n\r\n", to=port2)
+ok(status(r) == 404 and time.time() - t0 < 2, "an infinite device is a fast 404")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 200 and b"plain text" in r, "server responsive after special-file probes")
+usock.close()
+
+# --- round 5: a flood of blank lines dies fast, not in quadratic time ---
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+t0 = time.time()
+s.sendall(b"\n" * 32000 + b"GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+r = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    r += chunk
+elapsed = time.time() - t0
+ok(status(r) == 400 and elapsed < 2.0,
+   f"32000 leading blank lines rejected fast ({elapsed:.2f}s)")
+s.close()
+r = request(b"\r\n\r\nGET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 200, "two leading blank lines still tolerated")
+
+# --- round 5: absolute-form with a query and no path serves / ---
+r = request(b"GET http://x?q=1 HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 200 and b"<h1>hi</h1>" in r, "absolute-form query without path serves /")
+
+# --- round 5: duplicate Range headers combine to a multi-range -> 200 ---
+r = request(b"GET /big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-9\r\nRange: bytes=20-29\r\n\r\n")
+ok(status(r) == 200 and len(r.split(b"\r\n\r\n", 1)[1]) == 262144, "duplicate Range serves the full body")
+
+# --- round 5: Transfer-Encoding list edge cases on the wire ---
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked,\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+ok(status(r) == 200 and r.endswith(b"hello"), "Transfer-Encoding: chunked, (trailing comma) echoes")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+ok(status(r) == 400, "gzip+chunked stays rejected")
+
+# --- round 5: an impossible date is not a date; the precondition is ignored ---
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Tue, 31 Feb 2026 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 200, "If-Modified-Since with February 31st is ignored, not 304")
+
+# --- round 5: a long chunk extension is legal ---
+ext = b"x" * 400
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5;" + ext + b"\r\nhello\r\n0\r\n\r\n")
+ok(status(r) == 200 and r.endswith(b"hello"), "a 400-byte chunk extension echoes")
+
+# --- round 5: CONNECT is a 405 with Allow, like any unknown method ---
+r = request(b"CONNECT x:443 HTTP/1.1\r\nHost: x\r\n\r\n")
+ok(status(r) == 405 and b"Allow: GET, HEAD, POST, OPTIONS" in r, "CONNECT gets 405 + Allow")
+
+# --- round 5: a failed HEAD still answers without a body ---
+r = request(b"HEAD / HTTP/1.1\r\nHost: x\r\nBadHeader\r\n\r\n")
+head = r.split(b"\r\n\r\n")[0]
+ok(status(r) == 400 and r.split(b"\r\n\r\n", 1)[1] == b"",
+   "a parse error on HEAD carries no body")
+
+# --- round 5: HTTP/1.0 with both close and keep-alive closes ---
+s = socket.create_connection(("127.0.0.1", port), timeout=4)
+s.sendall(b"GET /a.txt HTTP/1.0\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n")
+r = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    r += chunk
+ok(status(r) == 200 and b"Connection: close" in r, "1.0 close+keep-alive: close wins on the wire")
+s.close()
+
+# --- round 5: an empty Host on HTTP/1.1 is a 400 ---
+r = request(b"GET / HTTP/1.1\r\nHost:\r\n\r\n")
+ok(status(r) == 400, "empty Host rejected on the wire")
+
+# --- round 5: graceful shutdown is capped; a second signal forces exit ---
+import subprocess, signal
+with open(os.path.join(root, "grace.bin"), "wb") as gf:
+    gf.write(os.urandom(50 * 1024 * 1024))
+for label, second in (("grace cap", False), ("second signal", True)):
+    p = None
+    try:
+        p = subprocess.Popen([binpath, "-d", root, "-p", "18109"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.4)
+        sc = socket.create_connection(("127.0.0.1", 18109), timeout=4)
+        sc.sendall(b"GET /grace.bin HTTP/1.1\r\nHost: x\r\n\r\n")
+        time.sleep(0.3)   # the write stalls: this client never reads
+        t0 = time.time()
+        p.send_signal(signal.SIGTERM)
+        if second:
+            time.sleep(0.5)
+            p.send_signal(signal.SIGTERM)
+        p.wait(timeout=12)
+        dt = time.time() - t0
+        sc.close()
+        if second:
+            ok(dt < 3.0, f"a second SIGTERM forces exit ({dt:.1f}s)")
+        else:
+            ok(4.0 < dt < 8.0, f"shutdown grace caps a stalled writer ({dt:.1f}s, not the 30s write timeout)")
+    finally:
+        if p and p.poll() is None:
+            p.kill()
+        if p:
+            p.wait()
+
+# --- round 5: the memory budget refuses the connection, not the process ---
+# -M 16: each incomplete 900 KB body holds its full buffer from the first
+# byte; at ~18 of them the 16 MB budget must trip with a clean 503 while
+# the earlier connections wait unharmed
+held = []
+codes = []
+for k in range(22):
+    sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+    sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 900000\r\n\r\n" + b"z" * 100)
+    sc.settimeout(0.6)
+    try:
+        h = sc.recv(65536)   # only a refused connection answers now
+        codes.append(status(h) if h else 0)
+    except socket.timeout:
+        codes.append("held")
+    held.append(sc)
+n503 = sum(1 for x in codes if x == 503)
+nheld = sum(1 for x in codes if x == "held")
+ok(n503 >= 1, f"memory budget: pressure earns a clean 503, not a crash ({n503} refused, {nheld} held)")
+ok(nheld >= 10, f"memory budget: connections within budget wait unharmed ({nheld} held)")
+# free four held connections first, so the echo fits the budget again
+freed = 0
+for k, code in enumerate(codes):
+    if code == "held" and freed < 4:
+        held[k].close()
+        freed += 1
+time.sleep(0.6)
+fin = [held[k] for k, x in enumerate(codes) if x == "held"][freed]
+fin.sendall(b"z" * 899900)
+fin.settimeout(8)
+r = b""
+while b"\r\n\r\n" not in r:
+    r += fin.recv(65536)
+ok(status(r) == 200, "a held body completes and echoes once sent")
+for sc in held:
+    sc.close()
+time.sleep(0.5)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
+ok(status(r) == 200, "server healthy after memory pressure")
+
+# -M validation
+p = subprocess.run([binpath, "-d", root, "-M", "5"], capture_output=True)
+ok(p.returncode == 2, "-M below the range is a usage error")
+
 # concurrency: 50 simultaneous clients
 
 results = []
@@ -757,7 +925,7 @@ sys.exit(fails)
 PYEOF
 RC=$?
 ok_stop=1
-for v in SPID SPID2 SPID3 SPID4 SPID5 SPID6 SPID7; do
+for v in SPID SPID2 SPID3 SPID4 SPID5 SPID6 SPID7 SPID8; do
   eval "p=\$$v"
   kill -TERM "$p" 2>/dev/null
   n=0

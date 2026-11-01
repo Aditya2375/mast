@@ -38,8 +38,21 @@ typedef enum {
 /* Lingering closes share a small budget, so clients that never FIN cannot
  * pin every connection slot in the drain state. */
 #define DRAIN_MAX_SHARE 4    /* of max_conn, capped at 16 */
+#define SHUTDOWN_GRACE_MS 5000   /* in-flight writes get this, then exit */
 
 static int g_drainers = 0;
+
+/* Total bytes held in per-connection dynamic buffers (request bodies and
+ * response heads/pages). Bounded by the -M budget: a connection that
+ * would push past it gets a 503 and closes instead of growing without
+ * limit, and a failed allocation fails that one connection, never the
+ * process. */
+static size_t g_dyn_bytes = 0;
+
+static size_t dyn_budget(const MastConfig *cfg) {
+    return (size_t)cfg->mem_budget_mb * 1024 * 1024;
+}
+
 
 typedef struct {
     int fd;
@@ -62,11 +75,23 @@ typedef struct {
     int turn_responses;     /* completed this loop pass (fairness) */
     long long turn_bytes;   /* written this loop pass (fairness) */
     int yielded;            /* budget spent with work pending: re-run */
+    size_t dyn_counted;     /* bytes this conn added to g_dyn_bytes */
     struct sockaddr_in peer;
 } Conn;
 
+/* only growth through the monitored paths (request bodies and response
+ * builds) is counted, and exactly that is handed back on close */
+static void dyn_return(Conn *c) {
+    g_dyn_bytes -= c->dyn_counted;
+    c->dyn_counted = 0;
+}
+
 static volatile sig_atomic_t g_stop = 0;
-static void on_signal(int sig) { (void)sig; g_stop = 1; }
+static void on_signal(int sig) {
+    (void)sig;
+    if (g_stop) _exit(1);   /* a second SIGINT/SIGTERM forces exit */
+    g_stop = 1;
+}
 
 static long long now_ms(void) {
     struct timespec ts;
@@ -80,6 +105,7 @@ static int set_nonblock(int fd) {
 }
 
 static void conn_free(Conn *c) {
+    dyn_return(c);
     mast_parser_free(&c->parser);
     mast_response_free(&c->resp);
     free(c->req.body);
@@ -111,6 +137,7 @@ static void log_access(Conn *c) {
 
 /* Reset per-request state for the next pipelined request on this conn. */
 static void conn_next_request(Conn *c) {
+    dyn_return(c);
     mast_response_free(&c->resp);
     mast_response_init(&c->resp);
     free(c->req.body);
@@ -187,8 +214,11 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
             if (r == MAST_PARSE_INCOMPLETE) return 0;   /* wait for bytes */
             if (r == MAST_PARSE_BAD) {
                 int status = atoi(c->parser.err_status);
-                mast_reply_error(&c->resp.head, &c->resp.mem, status,
-                                 c->parser.err_why, NULL, 0);
+                /* a response to HEAD never carries a body (RFC 9110
+                 * 9.3.2), even when the request then failed to parse */
+                mast_reply_error(&c->resp.head,
+                                 c->parser.err_head_method ? NULL : &c->resp.mem,
+                                 status, c->parser.err_why, NULL, 0);
                 c->resp.status = status;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -245,24 +275,58 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
         }
         /* body */
         if (c->req.chunked || c->req.content_length > 0) {
+            /* the feed grows the body buffer by at most this much */
+            size_t proj = c->req.chunked
+                ? c->parser.len
+                : (size_t)c->req.content_length + 1;
+            size_t grow = proj > c->req.body_cap ? proj - c->req.body_cap : 0;
+            size_t old_cap = c->req.body_cap;
+            if (grow && g_dyn_bytes + grow > dyn_budget(cfg)) {
+                mast_reply_error(&c->resp.head,
+                                 c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
+                                 503, "the server is out of buffer room, retry shortly",
+                                 "Retry-After: 1\r\n", 0);
+                c->resp.status = 503;
+                c->resp.close_after = 1;
+                c->responding = 1;
+                enter_write(c);
+                return 1;
+            }
             size_t bconsumed = 0;
             MastBodyRead br = mast_body_feed(&c->req, &c->body,
                                              c->parser.buf, c->parser.len, &bconsumed);
+            if (c->req.body_cap > old_cap) {
+                g_dyn_bytes += c->req.body_cap - old_cap;
+                c->dyn_counted += c->req.body_cap - old_cap;
+            }
             memmove(c->parser.buf, c->parser.buf + bconsumed, c->parser.len - bconsumed);
             c->parser.len -= bconsumed;
             if (br == MAST_BODY_INCOMPLETE) return 0;
             if (br == MAST_BODY_TOO_LARGE) {
-                mast_reply_error(&c->resp.head, &c->resp.mem, 413,
-                                 "the body grew past 1 MB", NULL, 0);
+                mast_reply_error(&c->resp.head,
+                                 c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
+                                 413, "the body grew past 1 MB", NULL, 0);
                 c->resp.status = 413;
                 c->resp.close_after = 1;
                 c->responding = 1;
                 enter_write(c);
                 return 1;
             }
+            if (br == MAST_BODY_NOMEM) {
+                mast_reply_error(&c->resp.head,
+                                 c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
+                                 503, "the server is out of buffer room, retry shortly",
+                                 "Retry-After: 1\r\n", 0);
+                c->resp.status = 503;
+                c->resp.close_after = 1;
+                c->responding = 1;
+                enter_write(c);
+                return 1;
+            }
             if (br == MAST_BODY_BAD) {
-                mast_reply_error(&c->resp.head, &c->resp.mem, 400,
-                                 "the chunked body framing is malformed", NULL, 0);
+                mast_reply_error(&c->resp.head,
+                                 c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
+                                 400, "the chunked body framing is malformed", NULL, 0);
                 c->resp.status = 400;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -272,7 +336,23 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
         }
         /* a complete request; the cap-th response says Connection: close */
         if (c->requests + 1 >= cfg->max_requests) c->req.keep_alive = 0;
+        if (c->req.method == MAST_METHOD_POST &&
+            g_dyn_bytes + c->req.body_len > dyn_budget(cfg)) {
+            /* the echo would copy the body into the response buffer */
+            mast_reply_error(&c->resp.head, &c->resp.mem, 503,
+                             "the server is out of buffer room, retry shortly",
+                             "Retry-After: 1\r\n", 0);
+            c->resp.status = 503;
+            c->resp.close_after = 1;
+            c->responding = 1;
+            enter_write(c);
+            return 1;
+        }
+        size_t old_hcap = c->resp.head.cap, old_mcap = c->resp.mem.cap;
         mast_respond(&c->req, cfg->docroot_real, &c->resp);
+        size_t grew = (c->resp.head.cap - old_hcap) + (c->resp.mem.cap - old_mcap);
+        g_dyn_bytes += grew;
+        c->dyn_counted += grew;
         c->responding = 1;
         enter_write(c);
         return 1;
@@ -449,6 +529,7 @@ int mast_serve(const MastConfig *cfg) {
 
     struct epoll_event evs[128];
     int work_pending = 0;   /* a yielded connection is owed another pass */
+    long long stop_since = 0;   /* when shutdown began, for the grace cap */
     while (!g_stop || nconn > 0) {
         int nev = epoll_wait(ep, evs, 128, g_stop ? 100 : (work_pending ? 0 : 500));
         if (nev < 0) {
@@ -545,6 +626,13 @@ int mast_serve(const MastConfig *cfg) {
          * events on the socket can never keep a dead connection alive.
          * During shutdown, anything not mid-response closes at once. */
         long long t = now_ms();
+        if (g_stop) {
+            if (!stop_since) stop_since = t;
+            /* graceful shutdown lets in-flight responses finish, but only
+             * within a grace cap: one non-reading client cannot hold the
+             * process up to the full write timeout */
+            if (t - stop_since > SHUTDOWN_GRACE_MS) break;
+        }
         for (int k = 0; k < cfg->max_conn; k++) {
             Conn *c = conns[k];
             if (!c) continue;
@@ -632,6 +720,11 @@ int mast_serve(const MastConfig *cfg) {
     epoll_ctl(ep, EPOLL_CTL_DEL, lfd, NULL);
     close(lfd);
     close(ep);
+    /* the grace-cap break can leave connections open; the process is
+     * exiting, but close them cleanly anyway */
+    for (int k = 0; k < cfg->max_conn; k++) {
+        if (conns[k]) { conn_free(conns[k]); free(conns[k]); }
+    }
     free(conns);
     fprintf(stdout, "mast: stopped\n");
     return 0;

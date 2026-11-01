@@ -74,6 +74,7 @@ typedef struct {
     int state;          /* 0 = request line, 1 = headers */
     char err_status[4]; /* "400", "408", ... when MAST_PARSE_BAD */
     char err_why[96];   /* one-line reason for the error page/log */
+    int err_head_method; /* the failed request line was HEAD: no body */
 } MastParser;
 
 void mast_parser_init(MastParser *p);
@@ -102,7 +103,8 @@ typedef enum {
     MAST_BODY_INCOMPLETE,   /* need more bytes */
     MAST_BODY_OK,           /* the body is complete */
     MAST_BODY_BAD,          /* malformed framing: 400 */
-    MAST_BODY_TOO_LARGE     /* over MAST_MAX_BODY: 413 */
+    MAST_BODY_TOO_LARGE,    /* over MAST_MAX_BODY: 413 */
+    MAST_BODY_NOMEM         /* the body buffer would not grow: 503 */
 } MastBodyRead;
 
 /* Incremental body state: content-length copies bytes; chunked decodes
@@ -111,7 +113,7 @@ typedef enum { MAST_CHUNK_SIZE, MAST_CHUNK_DATA, MAST_CHUNK_CRLF, MAST_CHUNK_TRA
 typedef struct {
     MastChunkState state;
     unsigned long long chunk_left;
-    char line[256];       /* a straddling chunk-size or trailer line */
+    char line[4096];      /* a straddling chunk-size or trailer line */
     size_t line_len;
 } MastBodyReader;
 

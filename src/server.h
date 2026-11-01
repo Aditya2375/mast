@@ -14,6 +14,7 @@ typedef struct {
     int body_timeout_ms;        /* a body must finish: 30000 */
     int max_requests;           /* requests per connection, then close: 1000 */
     int max_age_ms;             /* no connection outlives this: 300000 */
+    int mem_budget_mb;          /* all connection buffers together: 256 */
 } MastConfig;
 
 int mast_serve(const MastConfig *cfg);   /* blocks until shutdown */

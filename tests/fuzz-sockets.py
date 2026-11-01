@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Stateful socket fuzzer: drives the live server with random sessions -
 mutated seed requests in random chunk splits, pipelined batches, partial
-bodies, half-closes and rude RSTs. Individual replies are not checked
+bodies, half-closes and rude RSTs, oversized header blocks, outright
+floods and concurrent bursts. Individual replies are not checked
 (any 4xx or close is a valid answer to garbage); what must hold is that
 the server never crashes, never hangs, and still answers cleanly after
 the storm. BIN overrides the binary (default ./build/mast)."""
-import argparse, os, random, socket, struct, subprocess, sys, tempfile, time
+import argparse, os, random, socket, struct, subprocess, sys, tempfile, threading, time
 
 SEEDS = [
     b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -31,6 +32,60 @@ def mutate(rng, seed):
         else:
             data[pos:pos] = bytes([rng.randrange(256)]) * rng.randint(1, 3)
     return bytes(data)
+
+def one_session(rng, port, i):
+    """One fuzz session: a plain mutated stream, an oversized header
+    block, an all-at-once flood, or a pipelined storm."""
+    kind = rng.random()
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+    except OSError:
+        return
+    s.settimeout(0.6)
+    try:
+        if kind < 0.12:
+            # oversized head: 40 KB of headers, over the 32 KB cap
+            head = b"GET /a.txt HTTP/1.1\r\nHost: x\r\n" + \
+                b"".join(b"X-Pad-%d: %s\r\n" % (k, b"y" * 700)
+                         for k in range(rng.randint(40, 60))) + b"\r\n"
+            s.sendall(head)
+        elif kind < 0.27:
+            # flood: a large pipelined batch fired all at once
+            payload = mutate(rng, rng.choice(SEEDS)) * rng.randint(40, 120)
+            s.sendall(payload)
+        else:
+            for _ in range(rng.randint(1, 4)):
+                payload = mutate(rng, rng.choice(SEEDS))
+                if rng.random() < 0.3:
+                    payload = payload * rng.randint(2, 6)   # pipelined batch
+                # random fragmentation
+                while payload:
+                    n = rng.randint(1, len(payload))
+                    s.sendall(payload[:n])
+                    payload = payload[n:]
+                    if rng.random() < 0.2:
+                        time.sleep(rng.random() * 0.02)
+                if rng.random() < 0.4:
+                    # read a little, or everything briefly
+                    try:
+                        s.recv(rng.choice([64, 4096, 65536]))
+                    except (socket.timeout, ConnectionResetError):
+                        pass
+                if rng.random() < 0.3:
+                    s.shutdown(socket.SHUT_WR)
+                    break
+        try:
+            while s.recv(65536):
+                pass
+        except (socket.timeout, ConnectionResetError):
+            pass
+    except (OSError, ConnectionResetError, BrokenPipeError):
+        pass
+    if rng.random() < 0.2:
+        # rude close: RST instead of a clean FIN
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                     struct.pack("ii", 1, 0))
+    s.close()
 
 def main():
     ap = argparse.ArgumentParser()
@@ -61,44 +116,17 @@ def main():
             if srv.poll() is not None:
                 print(f"fuzz-sockets: server died after session {i}", file=sys.stderr)
                 sys.exit(1)
-            try:
-                s = socket.create_connection(("127.0.0.1", args.port), timeout=3)
-            except OSError:
+            if i % 12 == 11:
+                # a concurrent burst: several sessions at once
+                threads = [threading.Thread(target=one_session,
+                                            args=(rng, args.port, i))
+                           for _ in range(rng.randint(4, 10))]
+                for th in threads:
+                    th.start()
+                for th in threads:
+                    th.join()
                 continue
-            s.settimeout(0.6)
-            try:
-                for _ in range(rng.randint(1, 4)):
-                    payload = mutate(rng, rng.choice(SEEDS))
-                    if rng.random() < 0.3:
-                        payload = payload * rng.randint(2, 6)   # pipelined batch
-                    # random fragmentation
-                    while payload:
-                        n = rng.randint(1, len(payload))
-                        s.sendall(payload[:n])
-                        payload = payload[n:]
-                        if rng.random() < 0.2:
-                            time.sleep(rng.random() * 0.02)
-                    if rng.random() < 0.4:
-                        # read a little, or everything briefly
-                        try:
-                            s.recv(rng.choice([64, 4096, 65536]))
-                        except (socket.timeout, ConnectionResetError):
-                            pass
-                    if rng.random() < 0.3:
-                        s.shutdown(socket.SHUT_WR)
-                        break
-                try:
-                    while s.recv(65536):
-                        pass
-                except (socket.timeout, ConnectionResetError):
-                    pass
-            except (OSError, ConnectionResetError, BrokenPipeError):
-                pass
-            if rng.random() < 0.2:
-                # rude close: RST instead of a clean FIN
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                             struct.pack("ii", 1, 0))
-            s.close()
+            one_session(rng, args.port, i)
         # after the storm: a clean request must get a clean answer
         s = socket.create_connection(("127.0.0.1", args.port), timeout=5)
         s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")

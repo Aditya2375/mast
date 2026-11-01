@@ -47,6 +47,20 @@ int main(void) {
     CHECK(parse("G;ET / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
           "illegal byte in the method rejected");
     CHECK(parse("GET / HTTP/2.0\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_BAD, "HTTP/2 rejected as 505");
+    {
+        MastParser p;
+        mast_parser_init(&p);
+        const char *bad_head = "HEAD / HTTP/1.1\r\nHost: x\r\nBadHeader\r\n\r\n";
+        size_t cu = 0;
+        CHECK(mast_parser_feed(&p, bad_head, strlen(bad_head), &q, &cu) == MAST_PARSE_BAD
+              && p.err_head_method, "a failed HEAD flags no-body for the error page");
+        mast_parser_free(&p);
+        mast_parser_init(&p);
+        const char *bad_get = "GET / HTTP/1.1\r\nHost: x\r\nBadHeader\r\n\r\n";
+        CHECK(mast_parser_feed(&p, bad_get, strlen(bad_get), &q, &cu) == MAST_PARSE_BAD
+              && !p.err_head_method, "a failed GET keeps its error body");
+        mast_parser_free(&p);
+    }
     CHECK(parse("GET / HTTP/1.1\r\n\r\n", &q, &used) == MAST_PARSE_BAD, "1.1 without Host rejected");
     CHECK(parse("OPTIONS / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && q.method == MAST_METHOD_OPTIONS, "OPTIONS parses as its own method");
@@ -70,10 +84,25 @@ int main(void) {
     }
     CHECK(parse("\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK,
           "one empty line before the request is tolerated");
+    CHECK(parse("\r\n\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && strcmp(q.target, "/") == 0,
+          "a few empty lines before the request are tolerated");
+    {
+        char many[64];
+        memset(many, '\n', 9);
+        many[9] = '\0';
+        strcat(many, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        CHECK(parse(many, &q, &used) == MAST_PARSE_BAD,
+              "more than 8 empty lines before the request is a 400");
+    }
 
     /* header/target strictness */
     CHECK(parse("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
           "duplicate Host rejected");
+    CHECK(parse("GET / HTTP/1.1\r\nHost:\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
+          "an empty Host on HTTP/1.1 is a 400");
+    CHECK(parse("GET / HTTP/1.1\r\nHost:   \r\n\r\n", &q, &used) == MAST_PARSE_BAD,
+          "a whitespace-only Host on HTTP/1.1 is a 400");
     CHECK(parse("GET /\x1f HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
           "raw control byte in the target rejected");
     CHECK(parse("GET /\x7f HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
@@ -86,12 +115,28 @@ int main(void) {
                 &q, &used) == MAST_PARSE_BAD, "duplicate Transfer-Encoding rejected");
     CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, chunked\r\n\r\n",
                 &q, &used) == MAST_PARSE_BAD, "listed chunked rejected");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked,\r\n\r\n",
+                &q, &used) == MAST_PARSE_OK && q.chunked,
+          "a trailing comma in Transfer-Encoding is ignored");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:  chunked \r\n\r\n",
+                &q, &used) == MAST_PARSE_OK && q.chunked,
+          "whitespace around the coding is trimmed");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+                &q, &used) == MAST_PARSE_BAD, "chunked with another coding is a 400");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: ,\r\n\r\n",
+                &q, &used) == MAST_PARSE_BAD, "an empty Transfer-Encoding list is a 400");
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: disclose\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && q.keep_alive, "Connection tokens are exact: disclose is not close");
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, Close\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && !q.keep_alive, "Connection close token honored in a list");
     CHECK(parse("GET / HTTP/1.0\r\nConnection: xkeep-alivex\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && !q.keep_alive, "1.0 keep-alive needs the exact token");
+    CHECK(parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n", &q, &used)
+          == MAST_PARSE_OK && !q.keep_alive,
+          "1.0 with both keep-alive and close: close wins");
+    CHECK(parse("GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n", &q, &used)
+          == MAST_PARSE_OK && !q.keep_alive,
+          "1.0 listing both tokens: close wins");
 
     /* absolute-form: the path serves as origin-form, authority must match Host */
     CHECK(parse("GET http://x/absolute?y=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
@@ -101,6 +146,12 @@ int main(void) {
           "absolute-form and Host disagree: 400");
     CHECK(parse("GET https://x HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && strcmp(q.path, "/") == 0, "absolute-form without a path is /");
+    CHECK(parse("GET http://x?q=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && strcmp(q.path, "/") == 0 && strcmp(q.authority, "x") == 0,
+          "absolute-form with a query and no path serves /");
+    CHECK(parse("GET http://x/a.txt?q=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && strcmp(q.path, "/a.txt") == 0 && strcmp(q.authority, "x") == 0,
+          "absolute-form keeps the path and drops the query");
 
     /* fragmentation: the same request byte-by-byte must parse identically */
     {
@@ -226,7 +277,21 @@ int main(void) {
     mast_http_date(date, 784111777);
     CHECK(strcmp(date, "Sun, 06 Nov 1994 08:49:37 GMT") == 0, "http date formats IMF-fixdate");
     CHECK(mast_parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT") == 784111777, "date round-trips");
-    CHECK(mast_parse_http_date("garbage") == -1, "bad date rejected");
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: disclose\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && q.keep_alive, "Connection tokens are exact: disclose is not close");
+    CHECK(parse("GET /big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-9\r\nRange: bytes=20-29\r\n\r\n",
+                &q, &used) == MAST_PARSE_OK && q.range == NULL,
+          "duplicate Range headers combine to a multi-range, which mast ignores");
+    CHECK(mast_parse_http_date("Tue, 31 Feb 2026 08:49:37 GMT") == -1,
+          "February 31st is not a date");
+    CHECK(mast_parse_http_date("Fri, 29 Feb 2036 08:49:37 GMT") != -1,
+          "February 29th in a leap year is a date");
+    CHECK(mast_parse_http_date("Sun, 29 Feb 2032 08:49:37 GMT") != -1,
+          "February 29th 2032 (leap) parses");
+    CHECK(mast_parse_http_date("Mon, 29 Feb 2100 08:49:37 GMT") == -1,
+          "February 29th 2100 (not a leap year) rejected");
+    CHECK(mast_parse_http_date("Wed, 31 Apr 2026 08:49:37 GMT") == -1,
+          "April 31st is not a date");
     mast_http_date(date, 0);
     CHECK(strcmp(date, "Thu, 01 Jan 1970 00:00:00 GMT") == 0, "epoch formats");
 
@@ -261,6 +326,41 @@ int main(void) {
               "chunked body decodes");
         CHECK(r.body_len == 11 && memcmp(r.body, "hello world", 11) == 0, "chunked bytes right");
         CHECK(cu == strlen(wire), "chunked consumes the whole frame");
+        free(r.body);
+    }
+    {
+        /* a legal long chunk extension fits the raised line cap */
+        MastRequest r;
+        memset(&r, 0, sizeof r);
+        r.chunked = 1;
+        MastBodyReader br;
+        memset(&br, 0, sizeof br);
+        char wire[1200];
+        strcpy(wire, "5;");
+        memset(wire + 2, 'x', 400);
+        strcpy(wire + 402, "\r\nhello\r\n0\r\nX-Trailer: ");
+        memset(wire + 402 + strlen("\r\nhello\r\n0\r\nX-Trailer: "), 'y', 300);
+        strcat(wire, "\r\n\r\n");
+        size_t cu = 0;
+        CHECK(mast_body_feed(&r, &br, wire, strlen(wire), &cu) == MAST_BODY_OK
+              && r.body_len == 5 && memcmp(r.body, "hello", 5) == 0,
+              "a 400-byte chunk extension and a 300-byte trailer pass");
+        free(r.body);
+    }
+    {
+        /* ...but the cap still holds past 1023 bytes of size line */
+        MastRequest r;
+        memset(&r, 0, sizeof r);
+        r.chunked = 1;
+        MastBodyReader br;
+        memset(&br, 0, sizeof br);
+        char wire[1200];
+        strcpy(wire, "5;");
+        memset(wire + 2, 'x', 1100);
+        wire[1102] = '\0';
+        size_t cu = 0;
+        CHECK(mast_body_feed(&r, &br, wire, strlen(wire), &cu) == MAST_BODY_BAD,
+              "a size line past 1023 bytes is a 400");
         free(r.body);
     }
     {

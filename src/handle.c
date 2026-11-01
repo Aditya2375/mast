@@ -70,13 +70,13 @@ void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse
         r->close_after = !ka;
         return;
     }
-    if (!req->path_ok) {
-        err(r, req, 400, "the request target is not a safe path", NULL);
-        return;
-    }
     if (req->method == MAST_METHOD_OTHER) {
         err(r, req, 405, "this server speaks GET, HEAD, POST and OPTIONS",
             "Allow: GET, HEAD, POST, OPTIONS\r\n");
+        return;
+    }
+    if (!req->path_ok) {
+        err(r, req, 400, "the request target is not a safe path", NULL);
         return;
     }
     if (req->method == MAST_METHOD_POST) {

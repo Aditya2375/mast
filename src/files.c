@@ -126,11 +126,15 @@ static int open_beneath(int dfd, const char *rel) {
 #ifdef SYS_openat2
     struct open_how how;
     memset(&how, 0, sizeof how);
-    how.flags = O_RDONLY | O_CLOEXEC;
+    /* O_NONBLOCK: a FIFO or device in the docroot must never block the
+     * single-threaded loop on open; the S_ISREG check refuses it after */
+    how.flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
     long fd = syscall(SYS_openat2, dfd, rel, &how, (size_t)sizeof how);
     if (fd >= 0) return (int)fd;
-    if (errno == ENOSYS) return -2;
+    /* ENOSYS: no openat2; EPERM: a seccomp filter; EINVAL: unknown
+     * resolve flags - all mean "use the fallback", not "fail" */
+    if (errno == ENOSYS || errno == EPERM || errno == EINVAL) return -2;
     return -1;
 #else
     (void)dfd; (void)rel;
@@ -144,7 +148,8 @@ static int open_fallback(const char *joined, const char *docroot_real) {
     char real[4096];
     if (!realpath(joined, real)) return -1;
     if (!mast_path_beneath(real, docroot_real)) return -1;
-    return open(real, O_RDONLY | O_NOFOLLOW);
+    /* O_NONBLOCK as above: a FIFO can never wedge the server here */
+    return open(real, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
 }
 
 int mast_path_beneath(const char *resolved, const char *docroot) {
