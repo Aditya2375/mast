@@ -242,7 +242,7 @@ the request:
   exact ledger across keep-alive reuse), a dribbled no-LF head never
   blocking other clients - including a 28 KB header line dribbled in one
   byte at a time past the 8 KB request-line cap, the server's /proc CPU
-  for the whole dribble bounded at 150 ms - an 800-byte directory redirect with a
+  for the whole dribble bounded at 600 ms - an 800-byte directory redirect with a
   Content-Length that matches the delivered body byte for byte, invalid
   suffix ranges ignored with a 200, one Range honored but two through
   five ignored, junk dates ignored, control bytes (NUL included) in

@@ -1418,7 +1418,10 @@ ok(live, "other clients are served during a 28 KB no-LF dribble")
 ok(r.startswith(b"HTTP/1.1 200"), "the 28 KB dribbled header line completes into a 200")
 cpu1 = srv_cpu()
 if cpu0 is not None and cpu1 is not None:
-    ok(cpu1 - cpu0 < 0.150, "server CPU for a 28 KB no-LF dribble is bounded (%.3fs)" % (cpu1 - cpu0))
+    # 600 ms: the guard exists to catch superlinear rescans of the dribbled
+    # buffer (an O(n^2) regression at 28 KB costs seconds, not ms); the bound
+    # carries 4x headroom over instrumented (ASan/UBSan) CI timings.
+    ok(cpu1 - cpu0 < 0.600, "server CPU for a 28 KB no-LF dribble is bounded (%.3fs)" % (cpu1 - cpu0))
 bigdrib.close()
 
 # --- round 7: any repeated Range ignores the header, however many lines ---
