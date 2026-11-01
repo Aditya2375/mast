@@ -148,6 +148,11 @@ factory({}).then(m => {
        "wasm: HTTP/1.0 gets no interim 100");
 
     c = newConn();
+    r = send(c, "POST /nope.txt HTTP/1.1\r\nHost: demo\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\nx");
+    ok(statusOf(r) === 404 && r.includes("Connection: close\r\n") && !r.includes("keep-alive"),
+       "wasm: Expect rejected with 404 says Connection: close");
+
+    c = newConn();
     r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello");
     ok(statusOf(r) === 200 && r.endsWith("hello"), "wasm: identical duplicate Content-Length merges");
     c = newConn();

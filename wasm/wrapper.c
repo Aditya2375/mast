@@ -154,6 +154,9 @@ int mast_recv(DemoConn *c, const char *data, int n) {
                         c->closed = 1;
                         return 0;
                     } else {
+                        /* the demo conn closes after this answer, so the
+                         * head must say Connection: close (RFC 9112 9.6) */
+                        c->req.keep_alive = 0;
                         MastResponse resp;
                         mast_response_init(&resp);
                         mast_respond(&c->req, "/demo", &resp);

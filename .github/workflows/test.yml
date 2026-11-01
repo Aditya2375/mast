@@ -35,10 +35,18 @@ jobs:
       - name: stateful socket fuzz (live server, random sessions)
         run: |
           make build/mast
+          # guard: the plain step must really run the plain binary
+          if nm build/mast | grep -q __asan_init; then
+            echo "fuzz-sockets plain step would run an ASan binary"; exit 1
+          fi
           python3 tests/fuzz-sockets.py --sessions 60 --seed 20261201
       - name: stateful socket fuzz under sanitizers
         run: |
+          # make would call the existing plain binary "up to date": force it
+          rm -f build/mast
           make EXTRA="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" build/mast
+          # guard: prove the binary really carries ASan before trusting the step
+          nm build/mast | grep -q __asan_init || { echo "sanitized build/mast has no ASan symbols"; exit 1; }
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 python3 tests/fuzz-sockets.py --sessions 25 --seed 20261202
   wasm:
     runs-on: ubuntu-latest

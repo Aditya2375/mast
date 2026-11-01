@@ -12,6 +12,8 @@ typedef struct {
     int idle_timeout_ms;        /* keep-alive idle between requests: 15000 */
     int write_timeout_ms;       /* a stalled client write: 30000 */
     int body_timeout_ms;        /* a body must finish: 30000 */
+    int max_requests;           /* requests per connection, then close: 1000 */
+    int max_age_ms;             /* no connection outlives this: 300000 */
 } MastConfig;
 
 int mast_serve(const MastConfig *cfg);   /* blocks until shutdown */

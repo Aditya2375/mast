@@ -10,7 +10,7 @@ PORT=18099
 PORT2=18100
 PORT3=18101
 ROOT=$(mktemp -d)
-trap 'rm -rf "$ROOT"; for p in ${SPID:-} ${SPID2:-} ${SPID3:-} ${SPID4:-}; do kill "$p" 2>/dev/null; done' EXIT
+trap 'rm -rf "$ROOT"; for p in ${SPID:-} ${SPID2:-} ${SPID3:-} ${SPID4:-} ${SPID5:-} ${SPID6:-} ${SPID7:-}; do kill "$p" 2>/dev/null; done' EXIT
 
 printf '<h1>hi</h1>\n' > "$ROOT/index.html"
 printf 'plain text\n' > "$ROOT/a.txt"
@@ -36,9 +36,19 @@ SPID3=$!
 PORT4=18102
 "$BIN" -d "$ROOT" -p $PORT4 -c 4 > "$ROOT/server4.log" 2>&1 &
 SPID4=$!
+# round 4 servers: absolute deadlines, request cap, age cap
+PORT5=18105
+"$BIN" -d "$ROOT" -p $PORT5 -H 1000 > "$ROOT/server5.log" 2>&1 &
+SPID5=$!
+PORT6=18106
+"$BIN" -d "$ROOT" -p $PORT6 -R 3 > "$ROOT/server6.log" 2>&1 &
+SPID6=$!
+PORT7=18107
+"$BIN" -d "$ROOT" -p $PORT7 -A 2000 -I 30000 > "$ROOT/server7.log" 2>&1 &
+SPID7=$!
 sleep 0.4
 
-python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" <<'PYEOF'
+python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" "$PORT5" "$PORT6" "$PORT7" <<'PYEOF'
 import socket, sys, time, re, os
 import threading
 
@@ -48,6 +58,9 @@ port3 = int(sys.argv[3])
 root = sys.argv[4]
 port4 = int(sys.argv[5])
 binpath = os.path.abspath(sys.argv[6])
+port5 = int(sys.argv[7])
+port6 = int(sys.argv[8])
+port7 = int(sys.argv[9])
 checks = 0
 fails = 0
 
@@ -604,6 +617,127 @@ except OSError:
 srv.terminate()
 srv.wait(timeout=5)
 
+# --- round 4: Expect rejections must say Connection: close (RFC 9112 9.6) ---
+r = request(b"POST /elsewhere HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\nx")
+ok(status(r) == 404 and b"Connection: close\r\n" in r and b"keep-alive" not in r,
+   "Expect rejected with 404 says Connection: close")
+r = request(b"PUT /a.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\nx")
+ok(status(r) == 405 and b"Connection: close\r\n" in r and b"keep-alive" not in r,
+   "Expect rejected with 405 says Connection: close")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n" + b"x" * 100)
+ok(status(r) == 413 and b"Connection: close\r\n" in r, "Expect rejected with 413 says Connection: close")
+
+# --- round 4: a byte-drip trickler dies at the absolute header deadline ---
+s = socket.create_connection(("127.0.0.1", port5), timeout=6)   # -H 1000
+t0 = time.time()
+s.sendall(b"G")
+closed_at = None
+resp = b""
+for i in range(6):
+    time.sleep(0.7)
+    try:
+        s.sendall(b"E")
+    except OSError:
+        closed_at = time.time() - t0
+        break
+    try:
+        s.settimeout(0.01)
+        chunk = s.recv(65536)
+        if chunk:
+            resp += chunk
+            closed_at = time.time() - t0
+            break
+    except socket.timeout:
+        pass
+ok(closed_at is not None and closed_at < 3.0,
+   f"trickler (1 byte per 0.7s) dies at the absolute -H deadline ({closed_at and round(closed_at, 1)}s)")
+ok(resp.startswith(b"HTTP/1.1 408") or closed_at is not None, "the trickled conn gets a 408 or a close")
+s.close()
+
+# a slow but legitimate client under the deadline still works
+s = socket.create_connection(("127.0.0.1", port5), timeout=4)
+time.sleep(0.8)   # inside the 1s absolute header window
+s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+r = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    r += chunk
+ok(status(r) == 200 and b"plain text" in r, "slow-but-legitimate client under the deadline is served")
+s.close()
+
+# --- round 4: the per-connection request cap says close on the last one ---
+s = socket.create_connection(("127.0.0.1", port6), timeout=4)   # -R 3
+s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+          b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n"
+          b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
+h1, b1, rest = read_response(s)
+h2, b2, rest = read_response(s, rest)
+h3, b3, rest = read_response(s, rest)
+ok(b"Connection: keep-alive" in h1 and b"Connection: keep-alive" in h2,
+   "request cap: the first responses keep the connection")
+ok(b"Connection: close" in h3, "request cap: the last response says Connection: close")
+s.settimeout(2)
+try:
+    closed = s.recv(1) == b""
+except (socket.timeout, ConnectionResetError):
+    closed = True
+ok(closed, "request cap: the server closes after the cap-th response")
+s.close()
+
+# --- round 4: the max connection age beats the idle timeout ---
+s = socket.create_connection(("127.0.0.1", port7), timeout=5)   # -A 2000 -I 30000
+s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
+time.sleep(0.3)
+s.recv(65536)
+time.sleep(2.4)   # past the 2s age cap, far inside the 30s idle timeout
+s.settimeout(1.5)
+try:
+    closed = s.recv(1) == b""
+except (socket.timeout, ConnectionResetError):
+    closed = True
+ok(closed, "a connection older than -A closes even mid keep-alive")
+s.close()
+
+# --- round 4: a flooding peer cannot pin the lingering-close drain ---
+# port4 caps at 4 connections; a half-closed flooding drainer must free its
+# slot by the drain deadline even while it stays continuously readable
+fa = socket.create_connection(("127.0.0.1", port4), timeout=4)
+fa.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+fa.settimeout(4)
+resp = b""
+while True:
+    chunk = fa.recv(65536)
+    if not chunk:
+        break
+    resp += chunk
+ok(status(resp) == 200, "drainer got its full response before the flood")
+flood_t0 = time.time()
+flood_stop = threading.Event()
+def drainer_flood():
+    try:
+        while not flood_stop.is_set():
+            fa.sendall(b"z" * 65536)
+    except OSError:
+        pass
+ft = threading.Thread(target=drainer_flood)
+ft.start()
+holders = []
+for _ in range(3):
+    h = socket.create_connection(("127.0.0.1", port4), timeout=4)
+    holders.append(h)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", to=port4)
+ok(status(r) == 503, "the cap counts the flooding drainer while it drains")
+time.sleep(max(0, 6.0 - (time.time() - flood_t0)))
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", to=port4)
+ok(status(r) == 200, "flooding drainer's slot freed by the drain deadline")
+flood_stop.set()
+ft.join()
+fa.close()
+for h in holders:
+    h.close()
+
 # concurrency: 50 simultaneous clients
 
 results = []
@@ -623,7 +757,7 @@ sys.exit(fails)
 PYEOF
 RC=$?
 ok_stop=1
-for v in SPID SPID2 SPID3 SPID4; do
+for v in SPID SPID2 SPID3 SPID4 SPID5 SPID6 SPID7; do
   eval "p=\$$v"
   kill -TERM "$p" 2>/dev/null
   n=0

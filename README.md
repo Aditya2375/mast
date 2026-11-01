@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-1976 lines of C.
+2054 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -22,8 +22,10 @@ curl -i -X POST --data 'hello' http://localhost:8080/echo
 ```
 
 Flags: `-d DIR` document root (default `.`), `-p PORT` (default 8080),
-`-c N` maximum simultaneous connections (default 1024), and `-H`/`-I`/`-B`/`-W`
-to retune the header, idle, body and write timeouts in milliseconds.
+`-c N` maximum simultaneous connections (default 1024), `-H`/`-I`/`-B`/`-W`
+to retune the header, idle, body and write timeouts in milliseconds,
+`-R N` requests per connection before a graceful close (default 1000) and
+`-A MS` maximum connection age in milliseconds (default 300000).
 
 ## What it does
 
@@ -84,12 +86,21 @@ the request:
 - at most 64 headers per request,
 - a request target of at most 2047 bytes (the 2048th byte is a 414),
 - a 1 MB request body (413 past that, for both Content-Length and chunked),
-- a 10-second header timeout, 15 seconds idle between keep-alive
-  requests, 30 seconds for a stalled body or a stalled write - all measured
-  from real read/write progress, so junk bytes cannot keep a dead
-  connection alive. A head or body that stalls mid-request gets a 408
-  before the close (`-H`/`-I`/`-B`/`-W` retune the deadlines); a merely
-  idle or silent connection closes quietly,
+- every phase has two clocks: a stall timeout refreshed by real
+  read/write progress (a 10-second header timeout, 15 s idle between
+  keep-alive requests, 30 s for a stalled body or a stalled write) and an
+  absolute
+  deadline progress cannot move - the header phase ends 10 s after the
+  first byte of the request head, the body phase 30 s after the body
+  begins, and the write phase 8 times the write timeout after the response
+  begins. A trickler feeding one byte at a time dies on schedule; a head
+  or body that stalls mid-request gets a 408 before the close
+  (`-H`/`-I`/`-B`/`-W` retune the deadlines); a merely idle or silent
+  connection closes quietly,
+- per-connection caps: at most 1000 requests per connection (the last
+  response says `Connection: close`) and a maximum connection age of 5
+  minutes, so no connection lives forever no matter how politely it
+  behaves (`-R` and `-A` retune both),
 - at most 1024 simultaneous connections (configurable with `-c`); past
   the cap, new connections get a best-effort 503 instead of a silent
   reset. Keep `-c` comfortably below `ulimit -n` (each connection needs a
@@ -117,7 +128,10 @@ the request:
   but unknown method - `get`, `brew` - is a 405 with an Allow list, never
   a parser-level 400.
 - **Timeouts and caps everywhere.** Slowloris-style stalls hit the header
-  timeout; partial bodies and blocked clients hit their own deadlines.
+  timeout, and a byte-at-a-time trickler hits the absolute header deadline
+  even though every byte refreshes the stall clock; partial bodies and
+  blocked writes have their own stall clocks plus absolute caps, and the
+  request and age caps close even a perfectly behaved connection.
 - **No directory leaks.** An unreadable or missing file is the same 404, so
   the response never reveals what exists on disk.
 
@@ -139,7 +153,7 @@ the request:
 - a **290 checks** unit suite over the parser (including byte-by-byte
   fragmented feeds), path sanitizer, ranges, dates, chunked bodies and the
   full response pipeline against a temporary document root;
-- a **100 checks** live-socket suite that runs the real server and talks
+- a **113 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths,
@@ -148,10 +162,15 @@ the request:
   duplicate Content-Lengths, bare-LF heads, in-tree symlinks served and
   escaping ones refused, the 2047/2048-byte target boundary, mid-sendfile
   truncation, write/idle/header/body timeout deadlines with a 408 for
-  stalled requests, a 503 at the connection cap, pipelining fairness under
-  flood, fast SIGTERM shutdown with idle keep-alive conns while in-flight
-  responses complete, EMFILE recovery, a root-document-tree server and 50
-  concurrent clients;
+  stalled requests, a byte-drip trickler dying at the absolute header
+  deadline while a slow-but-legitimate client under it is served,
+  Expect-rejection responses saying `Connection: close` on the wire, the
+  request cap closing after the cap-th response, the connection-age cap
+  beating a longer idle timeout, a flooding peer failing to pin the
+  lingering-close drain, a 503 at the connection cap, pipelining fairness
+  under flood, fast SIGTERM shutdown with idle keep-alive conns while
+  in-flight responses complete, EMFILE recovery, a root-document-tree
+  server and 50 concurrent clients;
 - `tests/fuzz-sockets.py`, a stateful socket fuzzer: random mutated
   sessions with fragmentation, pipelining, half-closes and RSTs against
   the live server, asserting it never crashes and still answers cleanly

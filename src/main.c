@@ -19,7 +19,9 @@ static void usage(FILE *f) {
         "  -H header-ms        time to finish a request head (default: 10000)\n"
         "  -I idle-ms          keep-alive idle between requests (default: 15000)\n"
         "  -B body-ms          time to finish a request body (default: 30000)\n"
-        "  -W write-ms         stalled response write (default: 30000)\n");
+        "  -W write-ms         stalled response write (default: 30000)\n"
+        "  -R requests         requests per connection, then close (default: 1000)\n"
+        "  -A age-ms           max connection age (default: 300000)\n");
 }
 
 /* Numeric flags are strict: digits only, no sign, no leading whitespace -
@@ -36,8 +38,9 @@ int main(int argc, char **argv) {
     int port = 8080;
     int max_conn = 1024;
     int header_ms = 10000, idle_ms = 15000, body_ms = 30000, write_ms = 30000;
+    int max_req = 1000, max_age = 300000;
     int opt;
-    while ((opt = getopt(argc, argv, "d:p:c:H:I:B:W:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:p:c:H:I:B:W:R:A:h")) != -1) {
         char *endp = NULL;
         switch (opt) {
         case 'd': docroot = optarg; break;
@@ -79,6 +82,27 @@ int main(int argc, char **argv) {
             else write_ms = (int)v;
             break;
         }
+        case 'R': case 'A': {
+            if (!all_digits(optarg)) {
+                fprintf(stderr, "mast: -R is 1-100000, -A is 1000-3600000\n");
+                return 2;
+            }
+            long v = strtol(optarg, &endp, 10);
+            if (opt == 'R') {
+                if (!endp || *endp || v < 1 || v > 100000) {
+                    fprintf(stderr, "mast: -R is 1-100000\n");
+                    return 2;
+                }
+                max_req = (int)v;
+            } else {
+                if (!endp || *endp || v < 1000 || v > 3600000) {
+                    fprintf(stderr, "mast: -A is 1000-3600000\n");
+                    return 2;
+                }
+                max_age = (int)v;
+            }
+            break;
+        }
         case 'h': usage(stdout); return 0;
         default: usage(stderr); return 2;
         }
@@ -101,6 +125,8 @@ int main(int argc, char **argv) {
         .idle_timeout_ms = idle_ms,
         .write_timeout_ms = write_ms,
         .body_timeout_ms = body_ms,
+        .max_requests = max_req,
+        .max_age_ms = max_age,
     };
     return mast_serve(&cfg);
 }
