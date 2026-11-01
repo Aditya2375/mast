@@ -30,6 +30,7 @@ src/http.h|MAST_MAX_BODY (1024 \* 1024)|1 MB
 src/server.c|header_timeout_ms|header timeout
 src/server.c|sendfile|sendfile
 src/files.c|O_NOFOLLOW|symlink
+src/server.c|c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem|A response to HEAD never carries a body
 "
 printf '%s' "$pins" | while IFS='|' read -r file src_pat doc_pat; do
     [ -n "$file" ] || continue

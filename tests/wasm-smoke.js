@@ -138,6 +138,12 @@ factory({}).then(m => {
     ok(statusOf(r) === 431 && !!r.split("\r\n\r\n")[1],
        "wasm: the same 431 to a GET keeps its body");
 
+    /* round 9: HEAD + Expect + an oversize announced body is a bodyless 413 here too */
+    let hc5 = newConn();
+    r = send(hc5, "HEAD /hello.txt HTTP/1.1\r\nHost: demo\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n");
+    ok(statusOf(r) === 413, "wasm: HEAD with an oversize announced body is a 413");
+    ok(!r.split("\r\n\r\n")[1], "wasm: the oversize 413 to a HEAD sends no body");
+
     c = newConn();
     r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 100000\r\n\r\n" + "y".repeat(100000));
     ok(statusOf(r) === 200 && r.endsWith("y".repeat(100)) && r.includes("Content-Length: 100000"),

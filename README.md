@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2460 lines of C.
+2485 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -42,7 +42,9 @@ are not charged against it.
   (`"inode-size-seconds-nanoseconds"`, so a same-second same-size rewrite
   still changes it) and a Last-Modified date. Preconditions run in RFC
   9110 13.2.2 order: `If-Match` (strong comparison over a list, `*`
-  included) and `If-Unmodified-Since` answer 412 on failure; then
+  included) and `If-Unmodified-Since` answer 412 on failure - but a
+  precondition on a path that does not exist is a plain 404, like nginx
+  and Apache: there is no current representation to precondition; then
   `If-None-Match` - including comma lists and weak `W/` prefixes - and
   `If-Modified-Since` get a 304 with no body. `If-Range` gates a range on
   its validator, strictly: the exact entity-tag (a weak tag never holds)
@@ -70,8 +72,8 @@ are not charged against it.
   repeated Expect with a different value is a 400.
 - **Keep-alive and pipelining.** HTTP/1.1 connections stay open across
   requests; several requests written in one flight are answered in order,
-  with a per-turn budget (8 responses or 512 KB) so one fast pipelining
-  client cannot starve the others. A pipelined flood past the header cap
+  with a per-turn budget (8 responses or 512 KB, and a single large
+  response's write included) so one fast client cannot starve the others. A pipelined flood past the header cap
   while a response is pending is held back by TCP backpressure - the
   pending answer is never destroyed, the flood then gets its 431.
   HTTP/1.0 and an exact `Connection: close` token get their answer and a
@@ -124,8 +126,8 @@ the request:
   connection closes quietly,
 - per-connection caps: at most 1000 requests per connection (the last
   response says `Connection: close`) and a maximum connection age of 5
-  minutes, so no connection lives forever no matter how politely it
-  behaves (`-R` and `-A` retune both),
+  minutes, lingering closes included, so no connection lives forever no
+  matter how politely it behaves (`-R` and `-A` retune both),
 - at most 1024 simultaneous connections (configurable with `-c`); past
   the cap, new connections get a best-effort 503 instead of a silent
   reset. Keep `-c` comfortably below `ulimit -n` (each connection needs a
@@ -139,7 +141,10 @@ the request:
   and NUL are rejected. Files are opened with openat2(RESOLVE_BENEATH):
   the kernel resolves the whole path atomically beneath the docroot, so a
   symlink that stays inside the tree is served, one that escapes fails
-  with a 404, and there is no check-then-open window. On kernels without
+  with a 404, and there is no check-then-open window. An encoded slash
+  decodes to a real separator (`/dir%2Findex.html` is `/dir/index.html`)
+  - never an escape, since normalization happens after decoding - so a
+  fronting proxy that routes on the raw path should normalize first. On kernels without
   openat2 the fallback is realpath + a containment check + O_NOFOLLOW on
   the resolved leaf (safe while only the operator can write the docroot -
   the standing assumption for a static server).
@@ -181,7 +186,8 @@ the request:
 - The -M budget bounds the dynamic buffers held at once: each
   connection's parse backlog (pipelined bytes waiting their turn),
   request body and response pages - error pages and the 100-continue
-  interim included. A connection that would push past it
+  interim included, and an echo's response copy projected at its
+  buffer-doubling target before the body is accepted. A connection that would push past it
   gets a 503 with Retry-After: 1 and closes. The fixed Conn struct
   (about 40 KB per connection, so `-c 1024` carries roughly 40 MB
   whether the budget is reached or not) and the static file buffers are
@@ -202,7 +208,7 @@ the request:
   the same guarantee is tested live, below), path sanitizer, ranges,
   dates, chunked bodies and the full response pipeline against a
   temporary document root;
-- a **191 checks** live-socket suite that runs the real server and talks
+- a **201 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths,
@@ -235,7 +241,11 @@ the request:
   from the pre-parser paths (a capped flood's 431, a budget 503 over a
   buffered head prefix, a stalled head's 408), a 408-response budget
   ledger probed with an exact-fit fill, a directory 301 keeping its
-  query string, EMFILE
+  query string, the Expect-gated oversize 413 bodyless on HEAD, an echo
+  refused when its projected response doubling would pass the budget,
+  two concurrent 2 MB downloads completing byte-exact under the
+  per-turn write budget, a lingering close reaped by the age cap, the
+  at-cap 503 carrying Date and Server, EMFILE
   recovery, a root-document-tree server and 50 concurrent clients;
 - `tests/fuzz-sockets.py`, a stateful socket fuzzer: random mutated
   sessions with fragmentation, pipelining, half-closes, RSTs, oversized

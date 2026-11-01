@@ -200,6 +200,10 @@ static void enter_write(Conn *c) {
  * to close. */
 static int conn_flush(Conn *c) {
     while (c->out_sent < c->resp.head.len + c->resp.mem.len) {
+        /* the turn budget bounds one response's write as well, not just
+         * the pipelined count: past it, finish on a later pass (the
+         * caller marks the connection yielded) */
+        if (c->turn_bytes >= TURN_MAX_BYTES) return 0;
         const char *p;
         size_t n;
         if (c->out_sent < c->resp.head.len) {
@@ -221,6 +225,7 @@ static int conn_flush(Conn *c) {
         c->last_ms = now_ms();
     }
     while (c->resp.has_file && c->file_sent < c->resp.file_len) {
+        if (c->turn_bytes >= TURN_MAX_BYTES) return 0;
         off_t off = (off_t)(c->resp.file_off + c->file_sent);
         size_t want = (size_t)(c->resp.file_len - c->file_sent);
         ssize_t w = sendfile(c->fd, c->resp.file.fd, &off, want);
@@ -295,8 +300,9 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
                     c->last_ms = now_ms();
                 } else if (oversize) {
                     size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
-                    mast_reply_error(&c->resp.head, &c->resp.mem, 413,
-                                     "the body is over 1 MB", NULL, 0);
+                    mast_reply_error(&c->resp.head,
+                                     c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
+                                     413, "the body is over 1 MB", NULL, 0);
                     dyn_charge_resp(c, oh, om);
                     c->resp.status = 413;
                     c->resp.close_after = 1;
@@ -396,9 +402,14 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
         }
         /* a complete request; the cap-th response says Connection: close */
         if (c->requests + 1 >= cfg->max_requests) c->req.keep_alive = 0;
-        if (c->req.method == MAST_METHOD_POST &&
-            g_dyn_bytes + c->req.body_len > dyn_budget(cfg)) {
-            /* the echo would copy the body into the response buffer */
+        if (c->req.method == MAST_METHOD_POST) {
+            /* the echo copies the body into the response buffer, whose
+             * doubling can grow past the bare length (mast_buf_reserve):
+             * project the real target, or the budget is passed transiently */
+            size_t rtarget = c->resp.mem.cap ? c->resp.mem.cap : 256;
+            while (rtarget < c->resp.mem.len + c->req.body_len) rtarget *= 2;
+            size_t rgrow = rtarget > c->resp.mem.cap ? rtarget - c->resp.mem.cap : 0;
+            if (!(rgrow && g_dyn_bytes + rgrow > dyn_budget(cfg))) goto echo_fits;
             size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
             mast_reply_error(&c->resp.head, &c->resp.mem, 503,
                              "the server is out of buffer room, retry shortly",
@@ -410,6 +421,7 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
             enter_write(c);
             return 1;
         }
+        echo_fits:;
         size_t old_hcap = c->resp.head.cap, old_mcap = c->resp.mem.cap;
         mast_respond(&c->req, cfg->docroot_real, &c->resp);
         dyn_charge_resp(c, old_hcap, old_mcap);
@@ -575,6 +587,10 @@ static int conn_service(Conn *c, const MastConfig *cfg, uint32_t events) {
         ;
         int done = conn_flush(c);
         if (done < 0) return 1;
+        /* over the turn budget with bytes still to write: the socket may
+         * stay writable, so edge-triggered EPOLLOUT will not re-fire -
+         * ask the fairness pass for a fresh budget instead */
+        if (!done && c->turn_bytes >= TURN_MAX_BYTES) c->yielded = 1;
         if (done) {
             log_access(c);
             c->requests++;
@@ -670,14 +686,20 @@ int mast_serve(const MastConfig *cfg) {
                          * RST would look like a network fault */
                         static const char body[] =
                             "503 Service Unavailable\nthe server is full - try again later\n";
-                        char busy[256];
+                        char busy[512];
+                        char date[MAST_DATE_LEN];
+                        mast_http_date(date, (int64_t)time(NULL));
                         int bl = snprintf(busy, sizeof busy,
                             "HTTP/1.1 503 Service Unavailable\r\n"
+                            "Date: %s\r\n"
+                            "Server: mast\r\n"
                             "Content-Type: text/plain; charset=utf-8\r\n"
                             "Content-Length: %zu\r\nConnection: close\r\n\r\n%s",
-                            sizeof body - 1, body);
+                            date, sizeof body - 1, body);
                         if (bl > 0) {
-                            if ((size_t)bl > sizeof busy) bl = sizeof busy;
+                            /* snprintf reports the would-be length: never
+                             * read past the buffer */
+                            if ((size_t)bl >= sizeof busy) bl = sizeof busy - 1;
                             (void)!send(cfd, busy, (size_t)bl, MSG_NOSIGNAL);
                         }
                         close(cfd);
@@ -751,7 +773,10 @@ int mast_serve(const MastConfig *cfg) {
             Conn *c = conns[k];
             if (!c) continue;
             if (c->state == CONN_DRAIN_CLOSE) {
-                if (g_stop || t >= c->drain_deadline) {
+                /* the age cap covers lingering closes too: a drainer must
+                 * not outlive it by the drain deadline */
+                if (g_stop || t >= c->drain_deadline ||
+                    t - c->started_ms > cfg->max_age_ms) {
                     g_drainers--;
                     epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
                     conn_free(c);

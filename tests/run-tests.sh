@@ -208,6 +208,32 @@ ok(status(r) == 206 and len(r.split(b"\r\n\r\n", 1)[1]) == 100, "suffix range")
 r = request(b"GET /two-mb.bin HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 200 and len(r.split(b"\r\n\r\n", 1)[1]) == 2000000, "2MB file streams complete")
 
+# --- round 9: two fast 2 MB downloads interleave under the per-turn write budget ---
+pa = socket.create_connection(("127.0.0.1", port), timeout=10)
+pb = socket.create_connection(("127.0.0.1", port), timeout=10)
+pa.sendall(b"GET /two-mb.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+pb.sendall(b"GET /two-mb.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+bufs = {pa: b"", pb: b""}
+open_conns = [pa, pb]
+t_end = time.time() + 15
+while open_conns and time.time() < t_end:
+    for sc in list(open_conns):
+        try:
+            sc.settimeout(0.5)
+            chunk = sc.recv(65536)
+            if not chunk:
+                open_conns.remove(sc)
+            else:
+                bufs[sc] += chunk
+        except socket.timeout:
+            pass
+la = len(bufs[pa].partition(b"\r\n\r\n")[2])
+lb = len(bufs[pb].partition(b"\r\n\r\n")[2])
+ok(la == 2000000 and lb == 2000000,
+   f"two concurrent 2 MB downloads both complete byte-exact ({la}, {lb})")
+pa.close()
+pb.close()
+
 # conditional
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
 etag = re.search(rb'ETag: ("[^"]+")', r).group(1)
@@ -544,6 +570,8 @@ except (socket.timeout, ConnectionResetError):
 s503.close()
 ok(data503.startswith(b"HTTP/1.1 503") and b"Connection: close" in data503,
    "a full server answers 503, not an RST")
+ok(b"\r\nDate: " in data503 and b"\r\nServer: mast\r\n" in data503,
+   "the at-cap 503 carries Date and Server like every other response")
 for h in held:
     h.close()
 time.sleep(0.3)
@@ -754,6 +782,30 @@ except (socket.timeout, ConnectionResetError):
 ok(closed, "a connection older than -A closes even mid keep-alive")
 s.close()
 
+# --- round 9: a lingering close honors the connection-age cap too ---
+s = socket.create_connection(("127.0.0.1", port7), timeout=5)   # -A 2000
+s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+r = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    r += chunk
+ok(status(r) == 200 and b"Connection: close" in r,
+   "age-cap fixture: the close response lands before the linger")
+t0 = time.time()
+died = None
+for i in range(25):   # the peer never FINs; the server drains junk until a cap
+    time.sleep(0.4)
+    try:
+        s.sendall(b"x")
+    except OSError:
+        died = time.time() - t0
+        break
+ok(died is not None and died < 4.5,
+   f"lingering close dies at the age cap, not the 5s drain deadline ({died and round(died, 1)}s)")
+s.close()
+
 # --- round 4: a flooding peer cannot pin the lingering-close drain ---
 # port4 caps at 4 connections; a half-closed flooding drainer must free its
 # slot by the drain deadline even while it stays continuously readable
@@ -863,6 +915,14 @@ r = request(b"HEAD / HTTP/1.1\r\nHost: x\r\nBadHeader\r\n\r\n")
 head = r.split(b"\r\n\r\n")[0]
 ok(status(r) == 400 and r.split(b"\r\n\r\n", 1)[1] == b"",
    "a parse error on HEAD carries no body")
+
+# --- round 9: HEAD + Expect + an oversize announced body gets a bodyless 413 ---
+r = request(b"HEAD /a.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n")
+ok(status(r) == 413, "HEAD with an oversize announced body is a 413")
+ok(len(r.partition(b"\r\n\r\n")[2]) == 0, "the oversize 413 to a HEAD sends no body")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n")
+ok(status(r) == 413 and len(r.partition(b"\r\n\r\n")[2]) > 0,
+   "the same 413 to a POST keeps its body")
 
 # --- round 5: HTTP/1.0 with both close and keep-alive closes ---
 s = socket.create_connection(("127.0.0.1", port), timeout=4)
@@ -1068,6 +1128,32 @@ for sc in held3:
 time.sleep(0.5)
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
 ok(status(r) == 200, "server healthy after the backlog-503 pair")
+
+# --- round 9: the /echo budget pre-check projects the response doubling ---
+# 14 max-size bodies plus one tuner leave a headroom that fits a 400 KB
+# echo (projected growth 512 KB) but not a 600 KB one (projected 1 MB),
+# though either bare body length would fit
+held5 = []
+for k in range(14):
+    sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+    sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1048575\r\n\r\n" + b"z" * 100)
+    held5.append(sc)
+sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 595903\r\n\r\n" + b"z" * 100)
+held5.append(sc)
+time.sleep(0.4)
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 400000\r\nConnection: close\r\n\r\n" + b"e" * 400000, to=port8)
+ok(status(r) == 200 and r.partition(b"\r\n\r\n")[2] == b"e" * 400000,
+   "an echo that fits its projected growth succeeds")
+time.sleep(0.5)
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 600000\r\nConnection: close\r\n\r\n" + b"e" * 600000, to=port8)
+ok(status(r) == 503 and b"Retry-After: 1" in r,
+   "an echo whose response doubling would pass the budget is a 503")
+for sc in held5:
+    sc.close()
+time.sleep(0.5)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
+ok(status(r) == 200, "server healthy after the echo projection probes")
 
 # --- round 8: the 408 path charges its response to the -M ledger ---
 # 24 stalled heads each grow a 408 response; once they close, the ledger
