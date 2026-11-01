@@ -30,6 +30,16 @@ typedef enum {
 } ConnState;
 
 #define DRAIN_TIMEOUT_MS 5000
+/* Fairness: one connection may complete at most this many responses (or
+ * bytes) per loop pass; more buffered work yields its turn so a fast
+ * pipelining client cannot starve the rest. */
+#define TURN_MAX_RESPONSES 8
+#define TURN_MAX_BYTES (512 * 1024)
+/* Lingering closes share a small budget, so clients that never FIN cannot
+ * pin every connection slot in the drain state. */
+#define DRAIN_MAX_SHARE 4    /* of max_conn, capped at 16 */
+
+static int g_drainers = 0;
 
 typedef struct {
     int fd;
@@ -46,6 +56,9 @@ typedef struct {
     int requests;       /* completed requests on this connection */
     long long started_ms, last_ms;   /* last_ms: last real progress */
     long long drain_deadline;
+    int turn_responses;     /* completed this loop pass (fairness) */
+    long long turn_bytes;   /* written this loop pass (fairness) */
+    int yielded;            /* budget spent with work pending: re-run */
     struct sockaddr_in peer;
 } Conn;
 
@@ -127,11 +140,13 @@ static int conn_flush(Conn *c) {
         }
         ssize_t w = send(c->fd, p, n, MSG_NOSIGNAL);
         if (w < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
         if (w == 0) return 0;
         c->out_sent += (size_t)w;
+        c->turn_bytes += w;
         c->last_ms = now_ms();
     }
     while (c->resp.has_file && c->file_sent < c->resp.file_len) {
@@ -139,11 +154,13 @@ static int conn_flush(Conn *c) {
         size_t want = (size_t)(c->resp.file_len - c->file_sent);
         ssize_t w = sendfile(c->fd, c->resp.file.fd, &off, want);
         if (w < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
         if (w == 0) return -1;   /* truncated mid-transfer: cannot complete */
         c->file_sent += w;
+        c->turn_bytes += w;
         c->last_ms = now_ms();
     }
     return 1;
@@ -172,7 +189,9 @@ static int conn_process(Conn *c, const char *docroot) {
             memmove(c->parser.buf, c->parser.buf + consumed, c->parser.len - consumed);
             c->parser.len -= consumed;
             c->state = CONN_READ_BODY;
-            if (c->req.expect_continue && (c->req.chunked || c->req.content_length > 0)) {
+            if (c->req.expect_continue && c->req.minor >= 1 &&
+                (c->req.chunked || c->req.content_length > 0)) {
+                /* HTTP/1.0 has no 100-continue: the expectation is ignored */
                 /* RFC 9110 10.1.1: the interim 100 only when the body will
                  * be accepted; otherwise the final error right away, and
                  * the unread body must not poison a follow-up request. */
@@ -255,20 +274,14 @@ static int conn_read_drain(Conn *c, const char *docroot) {
     char tmp[16384];
     int pending = 0;
     for (;;) {
-        ssize_t r = recv(c->fd, tmp, sizeof tmp, 0);
-        if (r <= 0) {
-            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-            if (r < 0 && errno == EINTR) continue;
-            if (r == 0) c->peer_done = 1;   /* FIN: the request may still be whole */
-            else return -1;   /* a hard error mid-request */
-            break;
-        }
-        c->last_ms = now_ms();
         size_t cap = c->state == CONN_READ_HEAD
             ? MAST_MAX_HEADERS_BYTES
             : (size_t)MAST_MAX_BODY + 8192;
-        if (c->parser.len + (size_t)r > cap) {
-            if (pending) return -1;   /* flooding past a pending response */
+        if (c->parser.len >= cap) {
+            /* a pipelined flood past the cap while a response is pending
+             * must not kill the pending answer: stop reading and let TCP
+             * backpressure hold the client until the flush catches up */
+            if (pending) return 1;
             /* over a cap: answer cleanly; the lingering close then drains
              * the flood so the answer is not cut off by an RST */
             int status = c->state == CONN_READ_HEAD ? 431 : 413;
@@ -281,6 +294,16 @@ static int conn_read_drain(Conn *c, const char *docroot) {
             c->state = CONN_WRITE;
             return 1;
         }
+        size_t room = cap - c->parser.len;
+        ssize_t r = recv(c->fd, tmp, room < sizeof tmp ? room : sizeof tmp, 0);
+        if (r <= 0) {
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if (r < 0 && errno == EINTR) continue;
+            if (r == 0) c->peer_done = 1;   /* FIN: the request may still be whole */
+            else return -1;   /* a hard error mid-request */
+            break;
+        }
+        c->last_ms = now_ms();
         if (mast_parser_append(&c->parser, tmp, (size_t)r, cap) != 0) return -1;
         if (!pending) pending = conn_process(c, docroot);
     }
@@ -292,10 +315,76 @@ static int conn_read_drain(Conn *c, const char *docroot) {
  * still sends until its own FIN or a short deadline. This keeps unread
  * request bytes from turning our close into an RST that destroys the
  * response before the peer can read it. */
-static void conn_linger_close(Conn *c) {
+static int conn_linger_close(Conn *c, const MastConfig *cfg) {
+    int budget = cfg->max_conn / DRAIN_MAX_SHARE;
+    if (budget < 1) budget = 1;
+    if (budget > 16) budget = 16;
+    if (g_drainers >= budget) return 0;   /* budget spent: close at once */
+    g_drainers++;
     shutdown(c->fd, SHUT_WR);
     c->state = CONN_DRAIN_CLOSE;
     c->drain_deadline = now_ms() + DRAIN_TIMEOUT_MS;
+    return 1;
+}
+
+/* Service one connection: events is the epoll mask (EPOLLIN|EPOLLOUT for
+ * a fairness re-run after a yield). Returns 1 when the connection must be
+ * closed by the caller. A pipelining client gets a bounded budget of
+ * responses and bytes per pass; spending it with work still pending sets
+ * c->yielded, and the main loop re-runs the connection after the other
+ * connections had their turn. */
+static int conn_service(Conn *c, const MastConfig *cfg, uint32_t events) {
+    c->turn_responses = 0;
+    c->turn_bytes = 0;
+    if ((events & EPOLLERR) && c->state != CONN_WRITE) return 1;
+    if (c->state == CONN_DRAIN_CLOSE) {
+        /* lingering close: discard whatever the peer still sends */
+        char junk[8192];
+        ssize_t r;
+        while ((r = recv(c->fd, junk, sizeof junk, 0)) > 0) {}
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+            return 1;
+        if (now_ms() >= c->drain_deadline) return 1;
+        return 0;
+    }
+    if ((events & (EPOLLIN | EPOLLRDHUP)) &&
+        (c->state == CONN_READ_HEAD || c->state == CONN_READ_BODY)) {
+        int has = conn_read_drain(c, cfg->docroot_real);
+        if (has < 0) return 1;
+        if (has) goto write_side;
+        if (c->peer_done) return 1;   /* an incomplete request from a gone peer */
+    }
+    if ((events & EPOLLOUT) && c->state == CONN_WRITE) {
+    write_side:
+        ;
+        int done = conn_flush(c);
+        if (done < 0) return 1;
+        if (done) {
+            log_access(c);
+            c->requests++;
+            c->turn_responses++;
+            /* FIN only ends the connection once no pipelined request is
+             * still buffered */
+            if (c->resp.close_after) return conn_linger_close(c, cfg) ? 0 : 1;
+            if (c->peer_done && c->parser.len == 0) return 1;
+            conn_next_request(c);
+            /* pipelined bytes may already sit in the buffer; a flood held
+             * back by the cap (backpressure) resumes reading now */
+            int has = 0;
+            if (c->parser.len > 0) has = conn_process(c, cfg->docroot_real);
+            if (!has && !c->peer_done) has = conn_read_drain(c, cfg->docroot_real);
+            if (has) {
+                if (c->turn_responses >= TURN_MAX_RESPONSES ||
+                    c->turn_bytes >= TURN_MAX_BYTES) {
+                    c->yielded = 1;   /* continue on a later loop pass */
+                    return 0;
+                }
+                goto write_side;
+            }
+            if (c->peer_done && c->parser.len == 0) return 1;
+        }
+    }
+    return 0;
 }
 
 int mast_serve(const MastConfig *cfg) {
@@ -335,8 +424,9 @@ int mast_serve(const MastConfig *cfg) {
     fflush(stdout);
 
     struct epoll_event evs[128];
+    int work_pending = 0;   /* a yielded connection is owed another pass */
     while (!g_stop || nconn > 0) {
-        int nev = epoll_wait(ep, evs, 128, 500);
+        int nev = epoll_wait(ep, evs, 128, g_stop ? 100 : (work_pending ? 0 : 500));
         if (nev < 0) {
             if (errno == EINTR) continue;
             perror("epoll_wait");
@@ -350,8 +440,30 @@ int mast_serve(const MastConfig *cfg) {
                     struct sockaddr_in peer;
                     socklen_t plen = sizeof peer;
                     int cfd = accept4(lfd, (struct sockaddr *)&peer, &plen, SOCK_NONBLOCK);
-                    if (cfd < 0) break;   /* EAGAIN: the edge is drained */
-                    if (nconn >= cfg->max_conn) { close(cfd); continue; }
+                    if (cfd < 0) {
+                        if (errno == EMFILE || errno == ENFILE)
+                            /* out of fds (see -c vs ulimit -n in the
+                             * README): re-arm so a future close re-edges
+                             * the listener instead of stalling accepts */
+                            epoll_ctl(ep, EPOLL_CTL_MOD, lfd, &lev);
+                        break;   /* EAGAIN: the edge is drained */
+                    }
+                    if (nconn >= cfg->max_conn) {
+                        /* full: say so best-effort, then close - a silent
+                         * RST would look like a network fault */
+                        static const char body[] =
+                            "503 Service Unavailable\nthe server is full - try again later\n";
+                        char busy[256];
+                        int bl = snprintf(busy, sizeof busy,
+                            "HTTP/1.1 503 Service Unavailable\r\n"
+                            "Content-Type: text/plain; charset=utf-8\r\n"
+                            "Content-Length: %zu\r\nConnection: close\r\n\r\n%s",
+                            sizeof body - 1, body);
+                        if (bl > 0)
+                            (void)!send(cfd, busy, (size_t)bl, MSG_NOSIGNAL);
+                        close(cfd);
+                        continue;
+                    }
                     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
                     Conn *c = calloc(1, sizeof *c);
                     if (!c) { close(cfd); continue; }
@@ -377,61 +489,44 @@ int mast_serve(const MastConfig *cfg) {
                 continue;
             }
             Conn *c = evs[i].data.ptr;
-            if ((evs[i].events & EPOLLERR) && c->state != CONN_WRITE) goto close_conn;
-            if (c->state == CONN_DRAIN_CLOSE) {
-                /* lingering close: discard whatever the peer still sends */
-                char junk[8192];
-                ssize_t r;
-                while ((r = recv(c->fd, junk, sizeof junk, 0)) > 0) {}
-                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
-                    goto close_conn;
-                if (now_ms() >= c->drain_deadline) goto close_conn;
-                continue;
+            if (conn_service(c, cfg, evs[i].events)) {
+                for (int k = 0; k < cfg->max_conn; k++)
+                    if (conns[k] == c) { conns[k] = NULL; break; }
+                if (c->state == CONN_DRAIN_CLOSE) g_drainers--;
+                epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                conn_free(c);
+                free(c);
+                nconn--;
             }
-            if ((evs[i].events & (EPOLLIN | EPOLLRDHUP)) &&
-                (c->state == CONN_READ_HEAD || c->state == CONN_READ_BODY)) {
-                int has = conn_read_drain(c, cfg->docroot_real);
-                if (has < 0) goto close_conn;
-                if (has) goto write_side;
-                if (c->peer_done) goto close_conn;   /* an incomplete request from a gone peer */
+        }
+        /* fairness pass: every yielded connection gets one fresh budget
+         * after the others had their turn */
+        work_pending = 0;
+        for (int k = 0; k < cfg->max_conn; k++) {
+            Conn *c = conns[k];
+            if (!c || !c->yielded) continue;
+            c->yielded = 0;
+            if (conn_service(c, cfg, EPOLLIN | EPOLLOUT)) {
+                if (c->state == CONN_DRAIN_CLOSE) g_drainers--;
+                epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                conn_free(c);
+                free(c);
+                conns[k] = NULL;
+                nconn--;
+            } else if (c->yielded) {
+                work_pending = 1;
             }
-            if ((evs[i].events & EPOLLOUT) && c->state == CONN_WRITE) {
-            write_side:
-                ;
-                int done = conn_flush(c);
-                if (done < 0) goto close_conn;
-                if (done) {
-                    log_access(c);
-                    c->requests++;
-                    /* FIN only ends the connection once no pipelined
-                     * request is still buffered */
-                    if (c->resp.close_after) { conn_linger_close(c); continue; }
-                    if (c->peer_done && c->parser.len == 0) goto close_conn;
-                    conn_next_request(c);
-                    /* pipelined bytes may already sit in the buffer */
-                    if (c->parser.len > 0) {
-                        int has = conn_process(c, cfg->docroot_real);
-                        if (has) goto write_side;
-                    }
-                }
-            }
-            continue;
-        close_conn:
-            for (int k = 0; k < cfg->max_conn; k++)
-                if (conns[k] == c) { conns[k] = NULL; break; }
-            epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
-            conn_free(c);
-            free(c);
-            nconn--;
         }
         /* timeout sweep: every limit counts from real progress, so junk
-         * events on the socket can never keep a dead connection alive */
+         * events on the socket can never keep a dead connection alive.
+         * During shutdown, anything not mid-response closes at once. */
         long long t = now_ms();
         for (int k = 0; k < cfg->max_conn; k++) {
             Conn *c = conns[k];
             if (!c) continue;
             if (c->state == CONN_DRAIN_CLOSE) {
-                if (t >= c->drain_deadline) {
+                if (g_stop || t >= c->drain_deadline) {
+                    g_drainers--;
                     epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
                     conn_free(c);
                     free(c);
@@ -440,12 +535,41 @@ int mast_serve(const MastConfig *cfg) {
                 }
                 continue;
             }
+            if (g_stop && c->state != CONN_WRITE) {
+                /* shutdown: idle and half-read connections close at once;
+                 * only in-flight responses finish writing */
+                epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                conn_free(c);
+                free(c);
+                conns[k] = NULL;
+                nconn--;
+                continue;
+            }
             long long limit;
             if (c->state == CONN_READ_HEAD)
                 limit = c->requests > 0 ? cfg->idle_timeout_ms : cfg->header_timeout_ms;
             else if (c->state == CONN_READ_BODY) limit = cfg->body_timeout_ms;
             else limit = cfg->write_timeout_ms;
             if (t - c->last_ms > limit) {
+                /* a head or body that timed out mid-request still gets a
+                 * 408 when nothing was written yet; a merely idle or a
+                 * silent connection closes quietly */
+                if (!g_stop && !c->responding && c->resp.head.len == 0 &&
+                    (c->state == CONN_READ_BODY || c->parser.len > 0)) {
+                    mast_reply_error(&c->resp.head, &c->resp.mem, 408,
+                                     "the request took too long", NULL, 0);
+                    c->resp.status = 408;
+                    c->resp.close_after = 1;
+                    c->responding = 1;
+                    c->state = CONN_WRITE;
+                    c->last_ms = t;   /* the write timeout now governs */
+                    struct epoll_event cev;
+                    memset(&cev, 0, sizeof cev);
+                    cev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+                    cev.data.ptr = c;
+                    epoll_ctl(ep, EPOLL_CTL_MOD, c->fd, &cev);   /* re-edge the writable socket */
+                    continue;
+                }
                 epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
                 conn_free(c);
                 free(c);

@@ -86,14 +86,14 @@ factory({}).then(m => {
 
     c = newConn();
     r = send(c, "PUT /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
-    ok(statusOf(r) === 405 && r.includes("Allow: GET, HEAD, POST"), "wasm: PUT is 405 with Allow");
+    ok(statusOf(r) === 405 && r.includes("Allow: GET, HEAD, POST, OPTIONS"), "wasm: PUT is 405 with Allow");
     {
         /* 405 framing: Allow sits before the blank line, the body matches
          * Content-Length exactly, and a pipelined request stays aligned */
         const headEnd = r.indexOf("\r\n\r\n");
         const head = r.slice(0, headEnd);
         const cl = parseInt((head.match(/Content-Length: (\d+)/) || [])[1], 10);
-        ok(head.includes("Connection: keep-alive\r\nAllow: GET, HEAD, POST"), "wasm: 405 Allow is inside the head");
+        ok(head.includes("Connection: keep-alive\r\nAllow: GET, HEAD, POST, OPTIONS"), "wasm: 405 Allow is inside the head");
         ok(r.length === headEnd + 4 + cl, "wasm: 405 Content-Length matches the wire body");
     }
 
@@ -128,6 +128,62 @@ factory({}).then(m => {
     c = newConn();
     r = send(c, "OPTIONS * HTTP/1.1\r\nHost: demo\r\n\r\n");
     ok(statusOf(r) === 204 && r.includes("Allow: GET, HEAD, POST, OPTIONS"), "wasm: OPTIONS * is 204 with Allow");
+
+    c = newConn();
+    r = send(c, "OPTIONS /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok(statusOf(r) === 204 && r.includes("Allow: GET, HEAD, POST, OPTIONS"),
+       "wasm: OPTIONS on a path carries the same Allow list");
+
+    c = newConn();
+    r = send(c, "get /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok(statusOf(r) === 405, "wasm: lowercase get is 405, not 400");
+
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.1\nHost: demo\n\n");
+    ok(statusOf(r) === 200 && r.includes("hello, world"), "wasm: a bare-LF head is tolerated");
+
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.0\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello");
+    ok(statusOf(r) === 200 && !r.includes("100 Continue"),
+       "wasm: HTTP/1.0 gets no interim 100");
+
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello");
+    ok(statusOf(r) === 200 && r.endsWith("hello"), "wasm: identical duplicate Content-Length merges");
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello");
+    ok(statusOf(r) === 400, "wasm: conflicting Content-Length is 400");
+
+    c = newConn();
+    r = send(c, "GET /big.txt HTTP/1.1\r\nHost: demo\r\nRange: bytes=0-99999999999999999999999\r\n\r\n");
+    ok(statusOf(r) === 206 && r.includes("Content-Range: bytes 0-65535/65536"),
+       "wasm: an overflowing last-byte-pos clamps to EOF");
+
+    {
+        /* preconditions and strict If-Range against the demo filesystem */
+        c = newConn();
+        r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+        const et = (r.match(/ETag: ("[^"]+")/) || [])[1];
+        const lm = (r.match(/Last-Modified: ([^\r]+)/) || [])[1];
+        c = newConn();
+        r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-Match: \"stale\"\r\n\r\n");
+        ok(statusOf(r) === 412, "wasm: If-Match with a stale etag is 412");
+        c = newConn();
+        r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-Match: " + et + "\r\n\r\n");
+        ok(statusOf(r) === 200, "wasm: If-Match with the current etag passes");
+        c = newConn();
+        r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n");
+        ok(statusOf(r) === 412, "wasm: If-Unmodified-Since older than mtime is 412");
+        c = newConn();
+        r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-Range: " + lm + "\r\nRange: bytes=0-2\r\n\r\n");
+        ok(statusOf(r) === 206, "wasm: If-Range with the exact Last-Modified serves the range");
+        c = newConn();
+        r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-Range: W/" + et + "\r\nRange: bytes=0-2\r\n\r\n");
+        ok(statusOf(r) === 200, "wasm: If-Range with a weak etag serves the full body");
+        c = newConn();
+        r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-Range: Sun, 06 Nov 2094 08:49:37 GMT\r\nRange: bytes=0-2\r\n\r\n");
+        ok(statusOf(r) === 200, "wasm: If-Range with a future date serves the full body");
+    }
 
     c = newConn();
     r = send(c, "GET http://demo/hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");

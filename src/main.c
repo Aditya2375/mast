@@ -22,6 +22,15 @@ static void usage(FILE *f) {
         "  -W write-ms         stalled response write (default: 30000)\n");
 }
 
+/* Numeric flags are strict: digits only, no sign, no leading whitespace -
+ * strtol alone would silently accept " 500" or "+5". */
+static int all_digits(const char *s) {
+    if (!*s) return 0;
+    for (const char *q = s; *q; q++)
+        if (*q < '0' || *q > '9') return 0;
+    return 1;
+}
+
 int main(int argc, char **argv) {
     const char *docroot = ".";
     int port = 8080;
@@ -33,6 +42,10 @@ int main(int argc, char **argv) {
         switch (opt) {
         case 'd': docroot = optarg; break;
         case 'p':
+            if (!all_digits(optarg)) {
+                fprintf(stderr, "mast: port must be 1-65535\n");
+                return 2;
+            }
             port = (int)strtol(optarg, &endp, 10);
             if (!endp || *endp || port < 1 || port > 65535) {
                 fprintf(stderr, "mast: port must be 1-65535\n");
@@ -40,6 +53,10 @@ int main(int argc, char **argv) {
             }
             break;
         case 'c':
+            if (!all_digits(optarg)) {
+                fprintf(stderr, "mast: max-connections must be 1-65536\n");
+                return 2;
+            }
             max_conn = (int)strtol(optarg, &endp, 10);
             if (!endp || *endp || max_conn < 1 || max_conn > 65536) {
                 fprintf(stderr, "mast: max-connections must be 1-65536\n");
@@ -47,6 +64,10 @@ int main(int argc, char **argv) {
             }
             break;
         case 'H': case 'I': case 'B': case 'W': {
+            if (!all_digits(optarg)) {
+                fprintf(stderr, "mast: timeouts are 100-3600000 ms\n");
+                return 2;
+            }
             long v = strtol(optarg, &endp, 10);
             if (!endp || *endp || v < 100 || v > 3600000) {
                 fprintf(stderr, "mast: timeouts are 100-3600000 ms\n");

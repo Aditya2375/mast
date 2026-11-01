@@ -39,20 +39,26 @@ static void err(MastResponse *r, const MastRequest *req, int status, const char 
     r->close_after = !ka;
 }
 
-/* If-Range demands strong comparison: the exact entity-tag, or a date at
- * or after Last-Modified. Anything weaker means "send the whole file". */
+/* If-Range demands a strong validator (RFC 9110 13.1.4): the exact
+ * entity-tag (a weak W/ tag never holds), or an HTTP-date exactly equal
+ * to Last-Modified - one second early or late means "send the whole
+ * file", and so does a date in the future. */
 static int if_range_holds(const MastRequest *req, const MastFile *f) {
     if (!req->if_range) return 1;
+    if (req->if_range[0] == 'W' && req->if_range[1] == '/') return 0;
     if (strcmp(req->if_range, f->etag) == 0) return 1;
+    if (req->if_range[0] == '"') return 0;   /* an etag, but not this one */
     int64_t d = mast_parse_http_date(req->if_range);
-    return d >= 0 && (int64_t)f->st.st_mtime <= d;
+    return d >= 0 && d == (int64_t)f->st.st_mtime;
 }
 
 void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse *r) {
     int ka = req->keep_alive;
 
-    /* OPTIONS *: the whole server's capabilities (RFC 9110 9.3.7) */
-    if (strcmp(req->method_raw, "OPTIONS") == 0 && strcmp(req->target, "*") == 0) {
+    /* OPTIONS: the same Allow list for "*" and for any path, so the
+     * answer never depends on which form the client picked (RFC 9110
+     * 9.3.7). */
+    if (req->method == MAST_METHOD_OPTIONS) {
         mast_buf_puts(&r->head, "HTTP/1.1 204 No Content\r\n");
         char date[MAST_DATE_LEN];
         mast_http_date(date, (int64_t)time(NULL));
@@ -69,13 +75,19 @@ void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse
         return;
     }
     if (req->method == MAST_METHOD_OTHER) {
-        err(r, req, 405, "this server speaks GET, HEAD and POST",
-            "Allow: GET, HEAD, POST\r\n");
+        err(r, req, 405, "this server speaks GET, HEAD, POST and OPTIONS",
+            "Allow: GET, HEAD, POST, OPTIONS\r\n");
         return;
     }
     if (req->method == MAST_METHOD_POST) {
         if (strcmp(req->path, "/echo") != 0) {
             err(r, req, 404, "only /echo accepts a body here", NULL);
+            return;
+        }
+        /* an echoed body is no stored representation: every If-Match
+         * fails, including "*" (RFC 9110 13.1.1) */
+        if (req->if_match) {
+            err(r, req, 412, "If-Match failed: /echo stores nothing", NULL);
             return;
         }
         mast_reply_head(&r->head, 200, "OK",
@@ -113,6 +125,10 @@ void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse
                         date, r->file.etag, ka ? "keep-alive" : "close");
         r->status = 304;
         r->close_after = !ka;
+        return;
+    }
+    if (st == 412) {
+        err(r, req, 412, "a precondition failed", NULL);
         return;
     }
     if (st == 404) {

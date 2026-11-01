@@ -21,8 +21,15 @@ typedef struct {
 
 /* Resolve req->path under docroot. Returns an HTTP status: 200 with fd
  * open, 301 with redirect_to set (add the trailing slash), 304 not
- * modified, 404/403 on miss. Any answer besides 200 leaves fd == -1. */
+ * modified, 412 on a failed If-Match / If-Unmodified-Since precondition,
+ * 404 on miss (also for unreadable files and escaping symlinks). Any
+ * answer besides 200 leaves fd == -1. */
 int mast_file_open(const char *docroot, const MastRequest *req, MastFile *out);
+
+/* Containment test, shared by every resolved-path check: resolved must
+ * equal docroot or sit beneath it (boundary character included, so
+ * "/var/www2" never counts as inside "/var/www"). */
+int mast_path_beneath(const char *resolved, const char *docroot);
 
 /* Single-range parsing: "bytes=A-B", "bytes=A-", "bytes=-B". Returns 1 and
  * fills the start/len out-params (clamped to size). Returns 0 when the

@@ -64,12 +64,14 @@ const char *mast_reason(int status) {
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
     case 411: return "Length Required";
+    case 412: return "Precondition Failed";
     case 413: return "Content Too Large";
     case 414: return "URI Too Long";
     case 417: return "Expectation Failed";
     case 416: return "Range Not Satisfiable";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
     case 501: return "Not Implemented";
     case 505: return "HTTP Version Not Supported";
     default: return "Status";
@@ -201,7 +203,7 @@ void mast_parser_init(MastParser *p) {
 void mast_parser_free(MastParser *p) {
     free(p->buf);
     p->buf = NULL;
-    p->len = p->cap = p->pos = 0;
+    p->len = p->cap = 0;
 }
 
 static MastParse bad(MastParser *p, const char *status, const char *why) {
@@ -210,16 +212,19 @@ static MastParse bad(MastParser *p, const char *status, const char *why) {
     return MAST_PARSE_BAD;
 }
 
-static char *find_crlf(char *buf, size_t from, size_t len) {
-    for (size_t i = from; i + 1 < len; i++)
-        if (buf[i] == '\r' && buf[i + 1] == '\n') return buf + i;
-    return NULL;
+/* Line splitting accepts a bare LF as well as CRLF (RFC 9112 2.2: a
+ * server MAY tolerate bare-LF message heads). Chunk framing stays
+ * CRLF-strict - see mast_body_feed. */
+static const char *find_lf(const char *buf, size_t from, size_t len) {
+    const char *nl = memchr(buf + from, '\n', len - from);
+    return nl;
 }
 
 static int method_from(const char *m, size_t n) {
     if (n == 3 && memcmp(m, "GET", 3) == 0) return MAST_METHOD_GET;
     if (n == 4 && memcmp(m, "HEAD", 4) == 0) return MAST_METHOD_HEAD;
     if (n == 4 && memcmp(m, "POST", 4) == 0) return MAST_METHOD_POST;
+    if (n == 7 && memcmp(m, "OPTIONS", 7) == 0) return MAST_METHOD_OPTIONS;
     return MAST_METHOD_OTHER;
 }
 
@@ -288,19 +293,22 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
     out->content_length = -1;
 
     /* request line */
-    char *eol = find_crlf(p->buf, 0, p->len);
-    if (!eol) {
+    const char *nl = find_lf(p->buf, 0, p->len);
+    if (!nl) {
         if (p->len > MAST_MAX_REQUEST_LINE)
             return bad(p, "414", "the request line grew past 8 KB");
         return MAST_PARSE_INCOMPLETE;
     }
-    if (eol - p->buf > MAST_MAX_REQUEST_LINE)
+    if (nl - p->buf > MAST_MAX_REQUEST_LINE)
         return bad(p, "414", "the request line grew past 8 KB");
+    const char *eol = nl;
+    if (eol > p->buf && eol[-1] == '\r') eol--;   /* strip the optional CR */
     size_t line_len = (size_t)(eol - p->buf);
     if (line_len == 0) {
         /* an empty line before a request is tolerated (RFC 7230 3.5) */
-        memmove(p->buf, p->buf + 2, p->len - 2);
-        p->len -= 2;
+        size_t skip = (size_t)(nl - p->buf) + 1;
+        memmove(p->buf, p->buf + skip, p->len - skip);
+        p->len -= skip;
         return mast_parser_feed(p, NULL, 0, out, consumed);
     }
     char *sp1 = memchr(p->buf, ' ', line_len);
@@ -311,8 +319,9 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
     if (mlen == 0 || mlen >= sizeof out->method_raw)
         return bad(p, "400", "the method is empty or over 15 bytes");
     for (size_t i = 0; i < mlen; i++)
-        if (!isupper((unsigned char)p->buf[i]))
-            return bad(p, "400", "methods are uppercase tokens");
+        if (!isalnum((unsigned char)p->buf[i]) &&
+            !strchr("!#$%&'*+-.^_`|~", p->buf[i]))
+            return bad(p, "400", "the method has an illegal byte");
     memcpy(out->method_raw, p->buf, mlen);
     out->method_raw[mlen] = '\0';
     out->method = method_from(p->buf, mlen);
@@ -355,14 +364,13 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
 
     /* headers: read-only slices into the buffer, copied into the request's
      * pool, so a fragmented block re-parses identically after each feed */
-    const char *cur = eol + 2;
-    const char *bend = p->buf + p->len;
+    const char *cur = nl + 1;
     for (;;) {
-        const char *hend = NULL;
-        for (const char *q = cur; q + 1 < bend; q++)
-            if (q[0] == '\r' && q[1] == '\n') { hend = q; break; }
-        if (!hend) return MAST_PARSE_INCOMPLETE;
-        if (hend == cur) { cur += 2; break; }   /* the blank line: head done */
+        const char *hlf = find_lf(p->buf, (size_t)(cur - p->buf), p->len);
+        if (!hlf) return MAST_PARSE_INCOMPLETE;
+        const char *hend = hlf;
+        if (hend > cur && hend[-1] == '\r') hend--;   /* strip optional CR */
+        if (hend == cur) { cur = hlf + 1; break; }   /* the blank line: head done */
         size_t hlen = (size_t)(hend - cur);
         const char *colon = memchr(cur, ':', hlen);
         if (!colon) return bad(p, "400", "a header line has no colon");
@@ -401,12 +409,16 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
             out->connection = vp;
         }
         else if (name_is(np, nlen, "Content-Length")) {
-            if (out->content_length != -1)
-                return bad(p, "400", "two Content-Length headers");
             long long cl = 0;
             if (parse_decimal(vp, &cl) != 0)
                 return bad(p, "400", "Content-Length is not a non-negative integer");
-            out->content_length = cl;
+            if (out->content_length != -1) {
+                if (cl != out->content_length)
+                    return bad(p, "400", "conflicting Content-Length headers");
+                /* identical repeats merge (RFC 9110 8.6) */
+            } else {
+                out->content_length = cl;
+            }
         }
         else if (name_is(np, nlen, "Transfer-Encoding")) {
             if (strcasecmp(vp, "chunked") == 0) {
@@ -424,11 +436,13 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
             out->expect_continue = 1;
         }
         else if (name_is(np, nlen, "If-None-Match")) out->if_none_match = vp;
+        else if (name_is(np, nlen, "If-Match")) out->if_match = vp;
+        else if (name_is(np, nlen, "If-Unmodified-Since")) out->if_unmodified_since = vp;
         else if (name_is(np, nlen, "If-Modified-Since")) out->if_modified_since = vp;
         else if (name_is(np, nlen, "If-Range")) out->if_range = vp;
         else if (name_is(np, nlen, "Range")) out->range = vp;
         else if (name_is(np, nlen, "Content-Type")) out->content_type = vp;
-        cur = hend + 2;
+        cur = hlf + 1;
     }
 
     if (out->minor == 1 && !out->host)
@@ -455,14 +469,15 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
                             const char *data, size_t n, size_t *consumed) {
     *consumed = 0;
     if (!req->chunked && req->content_length <= 0) return MAST_BODY_OK;
-    if (!req->body) {
-        req->body = malloc(MAST_MAX_BODY + 1);
-        if (!req->body) { fprintf(stderr, "mast: out of memory\n"); exit(70); }
-        req->body_cap = MAST_MAX_BODY + 1;
-    }
     if (!req->chunked) {
         if ((unsigned long long)req->content_length > MAST_MAX_BODY)
             return MAST_BODY_TOO_LARGE;   /* the caller maps this to 413 */
+        /* sized to the declared length, never the whole cap up front */
+        if (!req->body) {
+            req->body = malloc((size_t)req->content_length + 1);
+            if (!req->body) { fprintf(stderr, "mast: out of memory\n"); exit(70); }
+            req->body_cap = (size_t)req->content_length + 1;
+        }
         size_t want = (size_t)req->content_length - req->body_len;
         size_t take = n < want ? n : want;
         memcpy(req->body + req->body_len, data, take);
@@ -470,6 +485,11 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
         *consumed = take;
         return req->body_len == (size_t)req->content_length
             ? MAST_BODY_OK : MAST_BODY_INCOMPLETE;
+    }
+    if (!req->body) {
+        req->body_cap = 4096;   /* chunked: grow as the body lands */
+        req->body = malloc(req->body_cap);
+        if (!req->body) { fprintf(stderr, "mast: out of memory\n"); exit(70); }
     }
     /* chunked framing: HEXSIZE [;ext] CRLF DATA CRLF ... 0 CRLF [trailers] CRLF.
      * Size and trailer lines straddle feeds, so they buffer into r->line
@@ -518,6 +538,15 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
             }
         } else if (r->state == MAST_CHUNK_DATA) {
             size_t take = n - i < r->chunk_left ? n - i : (size_t)r->chunk_left;
+            if (req->body_len + take > req->body_cap) {
+                size_t ncap = req->body_cap;
+                while (ncap < req->body_len + take) ncap *= 2;
+                if (ncap > MAST_MAX_BODY + 1) ncap = MAST_MAX_BODY + 1;
+                char *nb = realloc(req->body, ncap);
+                if (!nb) { fprintf(stderr, "mast: out of memory\n"); exit(70); }
+                req->body = nb;
+                req->body_cap = ncap;
+            }
             memcpy(req->body + req->body_len, data + i, take);
             req->body_len += take;
             i += take;

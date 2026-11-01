@@ -137,8 +137,9 @@ int mast_recv(DemoConn *c, const char *data, int n) {
                 c->have_head = 1;
                 memmove(c->parser.buf, c->parser.buf + consumed, c->parser.len - consumed);
                 c->parser.len -= consumed;
-                if (c->req.expect_continue &&
+                if (c->req.expect_continue && c->req.minor >= 1 &&
                     (c->req.chunked || c->req.content_length > 0)) {
+                    /* HTTP/1.0: the expectation is ignored, no interim */
                     /* same policy as the socket server: interim 100 only
                      * when the body will be accepted */
                     int oversize = !c->req.chunked && c->req.content_length > MAST_MAX_BODY;

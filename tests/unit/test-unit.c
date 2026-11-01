@@ -42,13 +42,32 @@ int main(void) {
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && !q.keep_alive, "1.1 close opt-out");
 
-    CHECK(parse("get / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_BAD, "lowercase method rejected");
+    CHECK(parse("get / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && q.method == MAST_METHOD_OTHER, "lowercase method parses, 405 later");
+    CHECK(parse("G;ET / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
+          "illegal byte in the method rejected");
     CHECK(parse("GET / HTTP/2.0\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_BAD, "HTTP/2 rejected as 505");
     CHECK(parse("GET / HTTP/1.1\r\n\r\n", &q, &used) == MAST_PARSE_BAD, "1.1 without Host rejected");
     CHECK(parse("OPTIONS / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && q.method == MAST_METHOD_OPTIONS, "OPTIONS parses as its own method");
+    CHECK(parse("PUT / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && q.method == MAST_METHOD_OTHER, "other methods parse (405 later)");
-    CHECK(parse("GET / HTTP/1.1\nHost: x\n\n", &q, &used) == MAST_PARSE_INCOMPLETE,
-          "bare LF never completes a request");
+    CHECK(parse("GET / HTTP/1.1\nHost: x\n\n", &q, &used) == MAST_PARSE_OK
+          && q.method == MAST_METHOD_GET && strcmp(q.host, "x") == 0,
+          "bare LF head is tolerated (RFC 9112 2.2)");
+    CHECK(parse("GET /a.txt HTTP/1.1\nHost: x\nConnection: close\n\n", &q, &used) == MAST_PARSE_OK
+          && !q.keep_alive, "bare LF headers parse exactly");
+    {
+        /* mixed endings, and pipelining after a bare-LF head */
+        MastParser p;
+        mast_parser_init(&p);
+        const char *two = "GET / HTTP/1.1\nHost: x\n\nGET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        size_t cu = 0;
+        CHECK(mast_parser_feed(&p, two, strlen(two), &q, &cu) == MAST_PARSE_OK
+              && cu == strlen("GET / HTTP/1.1\nHost: x\n\n"),
+              "bare LF head consumed exactly, pipelined bytes stay");
+        mast_parser_free(&p);
+    }
     CHECK(parse("\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK,
           "one empty line before the request is tolerated");
 
@@ -148,8 +167,11 @@ int main(void) {
           "header without colon rejected");
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
           "non-numeric Content-Length rejected");
-    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n", &q, &used)
-          == MAST_PARSE_BAD, "duplicate Content-Length rejected (smuggling)");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n", &q, &used)
+          == MAST_PARSE_OK && q.content_length == 1,
+          "identical duplicate Content-Length merges (RFC 9110 8.6)");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", &q, &used)
+          == MAST_PARSE_BAD, "conflicting Content-Length rejected (smuggling)");
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n", &q, &used)
           == MAST_PARSE_BAD, "CL + chunked rejected (smuggling)");
     CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n", &q, &used)
@@ -171,6 +193,12 @@ int main(void) {
           "query stripped, trailing slash kept");
     CHECK(!mast_sanitize_path("noslash", path, sizeof path), "non-absolute target rejected");
 
+    /* ---- containment helper ---- */
+    CHECK(mast_path_beneath("/var/www/a.txt", "/var/www") == 1, "beneath: child inside");
+    CHECK(mast_path_beneath("/var/www", "/var/www") == 1, "beneath: the root itself");
+    CHECK(mast_path_beneath("/var/www2/a", "/var/www") == 0, "beneath: sibling prefix rejected");
+    CHECK(mast_path_beneath("/etc/passwd", "/") == 1, "beneath: root docroot holds everything");
+
     /* ---- ranges ---- */
     long long st = 0, ln = 0;
     CHECK(mast_range_parse(NULL, 100, &st, &ln) == 0, "no range header");
@@ -186,6 +214,12 @@ int main(void) {
     CHECK(mast_range_parse("bytes=+1-4", 100, &st, &ln) == 0, "range with a sign ignored");
     CHECK(mast_range_parse("bytes=-0", 100, &st, &ln) == -1, "zero suffix unsatisfiable");
     CHECK(mast_range_parse("bytes=5-3", 100, &st, &ln) == -1, "last before first unsatisfiable");
+    CHECK(mast_range_parse("bytes=0-99999999999999999999999", 100, &st, &ln) == 1
+          && st == 0 && ln == 100, "overflowing last-byte-pos clamps to EOF (RFC 9110 14.2)");
+    CHECK(mast_range_parse("bytes=99999999999999999999999-", 100, &st, &ln) == -1,
+          "overflowing first-byte-pos is past EOF: 416");
+    CHECK(mast_range_parse("bytes=-99999999999999999999999", 100, &st, &ln) == 1
+          && st == 0 && ln == 100, "overflowing suffix serves the whole file");
 
     /* ---- dates ---- */
     char date[MAST_DATE_LEN];
@@ -314,6 +348,11 @@ int main(void) {
         /* a symlink out of the docroot must not be followed */
         snprintf(p, sizeof p, "%s/escape", root);
         if (symlink("/etc/passwd", p) != 0) { printf("FAIL: symlink setup\n"); fails = 1; }
+        /* symlinks that stay inside the docroot are served */
+        snprintf(p, sizeof p, "%s/link.txt", root);
+        if (symlink("index.html", p) != 0) { printf("FAIL: symlink setup\n"); fails = 1; }
+        snprintf(p, sizeof p, "%s/sublink", root);
+        if (symlink("sub", p) != 0) { printf("FAIL: symlink setup\n"); fails = 1; }
     }
 
     MastRequest rq;
@@ -351,6 +390,18 @@ int main(void) {
 
     RESPOND("GET /escape HTTP/1.1\r\nHost: x\r\n\r\n");
     CHECK(rs.status == 404, "a symlink out of the docroot is not followed");
+    mast_response_free(&rs);
+
+    RESPOND("GET /link.txt HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(rs.status == 200 && rs.has_file && rs.file_len == 12,
+          "an in-docroot symlink is served");
+    mast_response_free(&rs);
+    RESPOND("GET /sublink HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(rs.status == 301 && strstr(rs.head.buf, "Location: /sublink/"),
+          "an in-docroot dir symlink redirects");
+    mast_response_free(&rs);
+    RESPOND("GET /sublink/ HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(rs.status == 200 && rs.has_file, "an in-docroot dir symlink serves its index");
     mast_response_free(&rs);
 
     {
@@ -393,7 +444,7 @@ int main(void) {
     {
         char cl_line[64];
         snprintf(cl_line, sizeof cl_line, "Content-Length: %zu", rs.mem.len);
-        CHECK(rs.status == 405 && strstr(rs.head.buf, "Allow: GET, HEAD, POST\r\n"),
+        CHECK(rs.status == 405 && strstr(rs.head.buf, "Allow: GET, HEAD, POST, OPTIONS\r\n"),
               "405 carries Allow");
         CHECK(rs.head.len >= 4 && memcmp(rs.head.buf + rs.head.len - 4, "\r\n\r\n", 4) == 0,
               "405 head ends at the blank line");
@@ -460,7 +511,48 @@ int main(void) {
         mast_response_free(&rs);
         snprintf(req, sizeof req, "GET /big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-9\r\nIf-Range: %s\r\n\r\n", big_lm);
         RESPOND(req);
-        CHECK(rs.status == 206, "If-Range accepts a current HTTP-date");
+        CHECK(rs.status == 206, "If-Range accepts the exact Last-Modified date");
+        mast_response_free(&rs);
+        snprintf(req, sizeof req, "GET /big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-9\r\nIf-Range: W/%s\r\n\r\n", big_etag);
+        RESPOND(req);
+        CHECK(rs.status == 200 && rs.file_len == 102400, "If-Range with a weak etag serves the full body");
+        mast_response_free(&rs);
+        RESPOND("GET /big.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=0-9\r\nIf-Range: Sun, 06 Nov 2094 08:49:37 GMT\r\n\r\n");
+        CHECK(rs.status == 200 && rs.file_len == 102400,
+              "If-Range with a future date serves the full body (exact match only)");
+        mast_response_free(&rs);
+    }
+
+    /* If-Match / If-Unmodified-Since (RFC 9110 13.1.1, 13.1.3) */
+    {
+        char req[384];
+        RESPOND("GET /big.bin HTTP/1.1\r\nHost: x\r\nIf-Match: \"stale\"\r\n\r\n");
+        CHECK(rs.status == 412, "If-Match with a stale etag is 412");
+        mast_response_free(&rs);
+        RESPOND("GET /big.bin HTTP/1.1\r\nHost: x\r\nIf-Match: *\r\n\r\n");
+        CHECK(rs.status == 200, "If-Match: * passes an existing file");
+        mast_response_free(&rs);
+        snprintf(req, sizeof req, "GET /big.bin HTTP/1.1\r\nHost: x\r\nIf-Match: \"other\", %s\r\n\r\n",
+                 rs.file.etag);
+        RESPOND("GET /big.bin HTTP/1.1\r\nHost: x\r\n\r\n");   /* refresh the etag */
+        snprintf(req, sizeof req, "GET /big.bin HTTP/1.1\r\nHost: x\r\nIf-Match: \"other\", %s\r\n\r\n",
+                 rs.file.etag);
+        mast_response_free(&rs);
+        RESPOND(req);
+        CHECK(rs.status == 200, "If-Match list with the current etag passes");
+        mast_response_free(&rs);
+        RESPOND("GET /big.bin HTTP/1.1\r\nHost: x\r\nIf-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n");
+        CHECK(rs.status == 412, "If-Unmodified-Since older than mtime is 412");
+        mast_response_free(&rs);
+        RESPOND("GET /big.bin HTTP/1.1\r\nHost: x\r\nIf-Unmodified-Since: Sun, 06 Nov 2094 08:49:37 GMT\r\n\r\n");
+        CHECK(rs.status == 200, "If-Unmodified-Since after mtime passes");
+        mast_response_free(&rs);
+        RESPOND("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nIf-Match: *\r\n\r\n");
+        CHECK(rs.status == 412, "If-Match on /echo fails: nothing is stored");
+        mast_response_free(&rs);
+        /* 412 beats 304: If-Match is evaluated before If-None-Match */
+        RESPOND("GET /big.bin HTTP/1.1\r\nHost: x\r\nIf-Match: \"stale\"\r\nIf-None-Match: \"alsostale\"\r\n\r\n");
+        CHECK(rs.status == 412, "If-Match is evaluated before If-None-Match");
         mast_response_free(&rs);
     }
 
@@ -486,6 +578,16 @@ int main(void) {
     RESPOND("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n");
     CHECK(rs.status == 204 && rs.mem.len == 0 && !rs.has_file, "OPTIONS * is 204 without a body");
     CHECK(strstr(rs.head.buf, "Allow: GET, HEAD, POST, OPTIONS"), "OPTIONS * lists Allow");
+    mast_response_free(&rs);
+    RESPOND("OPTIONS /big.bin HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(rs.status == 204 && strstr(rs.head.buf, "Allow: GET, HEAD, POST, OPTIONS"),
+          "OPTIONS on a path carries the same Allow list");
+    mast_response_free(&rs);
+
+    /* a lowercase method is a syntactically fine token: 405, not 400 */
+    RESPOND("get / HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(rs.status == 405 && strstr(rs.head.buf, "Allow: GET, HEAD, POST, OPTIONS"),
+          "lowercase get is 405 with Allow");
     mast_response_free(&rs);
 
     /* a root ("/") docroot serves its tree: containment holds at dlen==1 */

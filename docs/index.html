@@ -51,7 +51,7 @@
   the parser is the real one, caps and all. Requests stay on one keep-alive
   connection until a response says close.</p>
 </main>
-<script src="mast.js?v=661a0ff94197"></script>
+<script src="mast.js?v=7b005e51f7e2"></script>
 <script>
 const out = document.getElementById('out');
 const req = document.getElementById('req');
@@ -73,6 +73,9 @@ const presets = {
   'POST /echo (chunked)': 'POST /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7\r\n, mast!\r\n0\r\n\r\n',
   'POST /echo (Expect: 100-continue)': 'POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello',
   'OPTIONS *': 'OPTIONS * HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'OPTIONS /hello.txt': 'OPTIONS /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'lowercase get (405)': 'get /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'If-Match fails (412)': 'GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-Match: "stale"\r\n\r\n',
   'pipelined x2': 'GET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\nGET /data.json HTTP/1.1\r\nHost: demo\r\n\r\n',
   'HTTP/1.0 (closes)': 'GET /hello.txt HTTP/1.0\r\n\r\n',
   'traversal attack': 'GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: demo\r\n\r\n',
@@ -143,7 +146,7 @@ function send(){
 sendBtn.addEventListener('click', send);
 newConnBtn.addEventListener('click', () => { newConn(); line('-- new connection #' + connNo + ' --\n', 'meta'); });
 
-MastModule({ locateFile: (path) => path + '?v=661a0ff94197' }).then(m => {
+MastModule({ locateFile: (path) => path + '?v=7b005e51f7e2' }).then(m => {
   M = m;
   M.ccall('mast_boot', null, [], []);
   newConn();

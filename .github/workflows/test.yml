@@ -32,6 +32,12 @@ jobs:
           make clean
           make EXTRA="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" build/test-fuzz
           UBSAN_OPTIONS=halt_on_error=1 python3 tests/fuzz.py --programs 50 --blobs 300
+      - name: stateful socket fuzz (live server, random sessions)
+        run: python3 tests/fuzz-sockets.py --sessions 60 --seed 20261201
+      - name: stateful socket fuzz under sanitizers
+        run: |
+          make EXTRA="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" build/mast
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 python3 tests/fuzz-sockets.py --sessions 25 --seed 20261202
   wasm:
     runs-on: ubuntu-latest
     steps:

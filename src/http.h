@@ -27,6 +27,7 @@ typedef enum {
     MAST_METHOD_GET,
     MAST_METHOD_HEAD,
     MAST_METHOD_POST,
+    MAST_METHOD_OPTIONS,
     MAST_METHOD_OTHER          /* syntactically fine, not served -> 405 */
 } MastMethod;
 
@@ -56,6 +57,8 @@ typedef struct {
     int keep_alive;               /* resolved: may the connection live on */
     const char *if_none_match;
     const char *if_modified_since;
+    const char *if_match;              /* If-Match list, or NULL */
+    const char *if_unmodified_since;   /* If-Unmodified-Since date, or NULL */
     const char *if_range;         /* raw If-Range validator, or NULL */
     const char *range;            /* raw Range header value, or NULL */
     const char *content_type;
@@ -68,7 +71,6 @@ typedef struct {
 typedef struct {
     char *buf;          /* receive buffer, grown up to the header cap */
     size_t len, cap;
-    size_t pos;         /* parse cursor */
     int state;          /* 0 = request line, 1 = headers */
     char err_status[4]; /* "400", "408", ... when MAST_PARSE_BAD */
     char err_why[96];   /* one-line reason for the error page/log */
