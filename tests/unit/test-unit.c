@@ -428,6 +428,14 @@ int main(void) {
           "overflowing first-byte-pos is past EOF: 416");
     CHECK(mast_range_parse("bytes=-99999999999999999999999", 100, &st, &ln) == 1
           && st == 0 && ln == 100, "overflowing suffix serves the whole file");
+    /* junk past the saturation point is still junk: keep validating the
+     * remaining digits instead of early-returning on the overflow */
+    CHECK(mast_range_parse("bytes=99999999999999999999X-3", 100, &st, &ln) == 0,
+          "junk after a saturated first-byte-pos is malformed");
+    CHECK(mast_range_parse("bytes=0-99999999999999999999X", 100, &st, &ln) == 0,
+          "junk after a saturated last-byte-pos is malformed");
+    CHECK(mast_range_parse("bytes=-99999999999999999999X", 100, &st, &ln) == 0,
+          "junk after a saturated suffix is malformed");
 
     /* ---- dates ---- */
     char date[MAST_DATE_LEN];

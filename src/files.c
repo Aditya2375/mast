@@ -57,12 +57,49 @@ const char *mast_mime(const char *path) {
 static int range_digits(const char *s, const char *end, long long *out) {
     if (s == end) return -1;
     long long v = 0;
+    int sat = 0;
     for (const char *q = s; q < end; q++) {
-        if (*q < '0' || *q > '9') return -1;
-        if (v > (9223372036854775807LL - 9) / 10) { *out = 9223372036854775807LL; return 1; }
-        v = v * 10 + (*q - '0');
+        if (*q < '0' || *q > '9') return -1;   /* malformed stays malformed, */
+        if (!sat) {                            /* even past the overflow point */
+            if (v > (9223372036854775807LL - 9) / 10) { sat = 1; v = 9223372036854775807LL; }
+            else v = v * 10 + (*q - '0');
+        }
     }
     *out = v;
+    return sat;
+}
+
+/* Build the Location for a directory redirect. req->path is the DECODED
+ * path: bytes that are legal in a header value but not in a URI (space,
+ * controls, non-ASCII, '%' itself) go back out percent-encoded, as nginx
+ * does. The query, still in its wire form from the request target, is
+ * appended verbatim. Returns -1 when the encoded redirect would not fit
+ * (the caller answers 404, as it does for an over-long target). */
+static int build_redirect(char *dst, size_t cap, const char *path, const char *query) {
+    char *w = dst, *end = dst + cap - 1;
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        unsigned char c = *p;
+        int plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') ||
+                    strchr("-._~!$&'()*+,;=:@/", c) != NULL;
+        if (plain) {
+            if (w == end) return -1;
+            *w++ = (char)c;
+        } else {
+            if (end - w < 3) return -1;
+            static const char hex[] = "0123456789ABCDEF";
+            *w++ = '%'; *w++ = hex[c >> 4]; *w++ = hex[c & 15];
+        }
+    }
+    if (w == end) return -1;
+    *w++ = '/';
+    if (query) {
+        size_t ql = strlen(query);
+        if ((size_t)(end - w) < ql) return -1;
+        memcpy(w, query, ql);
+        w += ql;
+    }
+    *w = '\0';
     return 0;
 }
 
@@ -214,10 +251,8 @@ int mast_file_open(const char *docroot_real, const MastRequest *req, MastFile *o
         if (req->path[strlen(req->path) - 1] != '/') {
             /* a directory without the slash: redirect to it, query intact */
             const char *q = strchr(req->target, '?');
-            int n = q
-                ? snprintf(out->redirect_to, sizeof out->redirect_to, "%s/%s", req->path, q)
-                : snprintf(out->redirect_to, sizeof out->redirect_to, "%s/", req->path);
-            if (n < 0 || (size_t)n >= sizeof out->redirect_to) { close(dfd); return 404; }
+            if (build_redirect(out->redirect_to, sizeof out->redirect_to,
+                               req->path, q) < 0) { close(dfd); return 404; }
             out->is_dir = 1;
             close(dfd);
             return 301;

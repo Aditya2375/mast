@@ -4,11 +4,15 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2648 lines of C.
+2696 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
-answering against an in-memory filesystem entirely on your machine.
+answering against an in-memory filesystem entirely on your machine. The
+demo is scoped to the request/response core: the socket-layer machinery
+(keep-alive limits, timeouts, the connection cap, the -M budget ledger)
+does not exist in a browser, and a very long response is truncated in
+the page rather than streamed.
 
 ## Quick start
 
@@ -64,7 +68,11 @@ are not charged against it.
   14.2 leaves the choice to implementations). Unknown units,
   malformed ranges, invalid specs (`bytes=-` and `bytes=-0` are invalid,
   not unsatisfiable) and multi-range requests are ignored and get the
-  full 200 body, as RFC 9110 permits.
+  full 200 body, as RFC 9110 permits. A last-byte-pos before the first
+  (`bytes=5-2`) is unsatisfiable: a 416, as nginx does. And a digit run
+  that overflows 64 bits is validated to its end before saturating -
+  junk characters past the overflow point still make the spec malformed
+  (ignored, full 200), while a clean overflow clamps per RFC 9110 14.2.
 - **POST /echo.** The request body comes back verbatim with its
   content-type, whether it arrived with a Content-Length or chunked
   transfer-coding (chunk extensions and trailers included, though a
@@ -136,8 +144,11 @@ the request:
 - at most 1024 simultaneous connections (configurable with `-c`); past
   the cap, a small set of overflow slots answers 503 through the normal
   machinery - a full flush, then a lingering close that drains the unread
-  request, so a well-behaved client always receives the answer instead of
-  a reset that looks like a network fault. Only when even those slots are
+  request, so a well-behaved client receives the answer instead of
+  a reset that looks like a network fault. The lingering drain draws on a
+  small shared budget: at a tiny `-c` under a flood it can be spent, and
+  those overflow answers close right after the flush and may race an RST
+  on an impatient client. Only when even the overflow slots are
   busy does mast fall back to one best-effort write before closing. Keep `-c` comfortably below `ulimit -n` (each connection needs a
   file descriptor, plus the listener, epoll and open files); if accept
   still hits EMFILE, the listener re-arms and retries once slots free.
@@ -182,6 +193,11 @@ the request:
 
 - Linux only - the event loop is epoll, file bodies use sendfile, and
   containment uses openat2 (with the realpath fallback above).
+- IPv4 only - the listener binds AF_INET on all interfaces. Run a
+  dual-stack front proxy if you need IPv6.
+- The listener accepts at most 64 pending connections per event-loop
+  turn; a longer backlog surfaces on the next turn, so a connect flood
+  cannot starve connections already owed service.
 - No TLS. Put mast behind a TLS-terminating proxy if you need HTTPS.
 - Single process, single thread. One core serves everything.
 - No virtual hosts, no content negotiation, no compression, no CGI.
@@ -196,11 +212,14 @@ the request:
   request body and response pages - error pages and the 100-continue
   interim included, and an echo's response copy projected at its
   buffer-doubling target before the body is accepted. A connection that would push past it
-  gets a 503 with Retry-After: 1 and closes. The fixed Conn struct
+  gets a 503 with Retry-After: 1 and closes. The one soft edge is the
+  refusal machinery itself: a connection already at the wall still gets
+  its small 408/431/503 error page written, so a connection can exceed
+  the budget by one error page before it closes. The fixed Conn struct
   (about 49 KB per connection - the request, response,
-  body-reader and parser structs alone are 49152 bytes, so `-c 1024`
-  carries roughly 50 MB whether the budget is reached or not) and the static file buffers are
-  separate. A malloc failure inside the budget means the host itself is
+  body-reader and parser structs alone are 49152 bytes) is calloc'd
+  lazily as connections arrive, up to roughly 50 MB at `-c 1024`; it and
+  the static file buffers are separate from the budget. A malloc failure inside the budget means the host itself is
   out of memory, which no static server survives usefully - mast exits
   70 then.
 - Graceful shutdown lets in-flight writes finish for up to 5 seconds;
@@ -211,13 +230,13 @@ the request:
 
 `make test` runs three layers:
 
-- a **353 checks** unit suite over the parser (including byte-by-byte
+- a **356 checks** unit suite over the parser (including byte-by-byte
   fragmented feeds and a CPU bound on a 26 KB head dribbled in one byte
   at a time through the library feed API - the socket server's side of
   the same guarantee is tested live, below), path sanitizer, ranges,
   dates, chunked bodies and the full response pipeline against a
   temporary document root;
-- a **213 checks** live-socket suite that runs the real server and talks
+- a **221 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths

@@ -612,7 +612,7 @@ static int conn_linger_close(Conn *c, const MastConfig *cfg) {
 static int conn_service(Conn *c, const MastConfig *cfg, uint32_t events) {
     c->turn_responses = 0;
     c->turn_bytes = 0;
-    if ((events & EPOLLERR) && c->state != CONN_WRITE) return 1;
+    if (events & EPOLLERR) return 1;   /* a dead peer closes at once, in any state */
     if (c->state == CONN_DRAIN_CLOSE) {
         /* lingering close: discard whatever the peer still sends, but
          * bounded per call - a continuously readable peer gets the rest
@@ -743,7 +743,19 @@ int mast_serve(const MastConfig *cfg) {
              * is the one event whose ptr is the sentinel instead */
             if (evs[i].data.ptr == &g_listener_tag) {
                 if (g_stop) continue;
+                /* bounded accepts per turn: under a connect flood at the
+                 * connection cap the accept/503/close cycle would
+                 * otherwise keep re-accepting on this one event and never
+                 * yield to the connections already owed service */
+                int accepts = 0;
                 for (;;) {
+                    if (accepts == 64) {
+                        /* turn spent with the backlog still pending:
+                         * re-arm the edge so the rest surfaces as a
+                         * fresh event after the other connections ran */
+                        epoll_ctl(ep, EPOLL_CTL_MOD, lfd, &lev);
+                        break;
+                    }
                     struct sockaddr_in peer;
                     socklen_t plen = sizeof peer;
                     int cfd = accept4(lfd, (struct sockaddr *)&peer, &plen, SOCK_NONBLOCK);
@@ -755,6 +767,7 @@ int mast_serve(const MastConfig *cfg) {
                             epoll_ctl(ep, EPOLL_CTL_MOD, lfd, &lev);
                         break;   /* EAGAIN: the edge is drained */
                     }
+                    accepts++;
                     if (nconn >= cfg->max_conn) {
                         /* full: answer 503 through the usual machinery -
                          * a normal flush, then a lingering close that
