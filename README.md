@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2549 lines of C.
+2648 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -59,7 +59,9 @@ are not charged against it.
   `If-Match` there is a 412.
 - **Range requests.** A single byte range per request - `bytes=0-99`,
   `bytes=500-` or the last N bytes with `bytes=-64` - answered 206 with a
-  Content-Range header; an unsatisfiable range is a 416. Unknown units,
+  Content-Range header; an unsatisfiable range is a 416. A suffix range
+  on an empty file is 416 too - no byte exists to satisfy it (RFC 9110
+  14.2 leaves the choice to implementations). Unknown units,
   malformed ranges, invalid specs (`bytes=-` and `bytes=-0` are invalid,
   not unsatisfiable) and multi-range requests are ignored and get the
   full 200 body, as RFC 9110 permits.
@@ -91,7 +93,9 @@ are not charged against it.
   answer 204 with the same Allow list (conditional headers are ignored
   there - OPTIONS describes the server, not a representation);
   `GET http://host/path` serves its path, and a 400 when the authority
-  and the Host header disagree.
+  and the Host header disagree - a deliberate hardening deviation from
+  RFC 9112 3.2.2, which says to ignore Host on an absolute-form target:
+  mast treats the disagreement as smuggling bait and refuses.
 - **HEAD stays bodyless.** A response to HEAD never carries a body - not
   even an error page, and not even when the error fires before the parser
   ran: the header-cap 431, the budget 503 and the stall 408 judge the
@@ -108,9 +112,10 @@ the request:
 
 - an 8 KB request line and 32 KB of headers in total,
 - at most 64 headers per request, at most 8 empty lines before the
-  request (RFC 9112 3.5 asks a server to tolerate one), chunk-size lines
-  of 1023 bytes and trailer lines of 4094 (room for long chunk
-  extensions),
+  request (RFC 9112 3.5 asks a server to tolerate one - and mast counts
+  them across dribbled reads, not per recv), chunk-size lines of 1021
+  bytes and trailer lines of 4092 (both plus the CRLF; room for long
+  chunk extensions),
 - a request target of at most 2047 bytes (the 2048th byte is a 414),
 - a 1 MB request body (413 past that, for both Content-Length and chunked),
 - every phase has two clocks: a stall timeout refreshed by real
@@ -193,7 +198,7 @@ the request:
   buffer-doubling target before the body is accepted. A connection that would push past it
   gets a 503 with Retry-After: 1 and closes. The fixed Conn struct
   (about 49 KB per connection - the request, response,
-  body-reader and parser structs alone are 49144 bytes, so `-c 1024`
+  body-reader and parser structs alone are 49152 bytes, so `-c 1024`
   carries roughly 50 MB whether the budget is reached or not) and the static file buffers are
   separate. A malloc failure inside the budget means the host itself is
   out of memory, which no static server survives usefully - mast exits
@@ -206,18 +211,19 @@ the request:
 
 `make test` runs three layers:
 
-- a **345 checks** unit suite over the parser (including byte-by-byte
+- a **353 checks** unit suite over the parser (including byte-by-byte
   fragmented feeds and a CPU bound on a 26 KB head dribbled in one byte
   at a time through the library feed API - the socket server's side of
   the same guarantee is tested live, below), path sanitizer, ranges,
   dates, chunked bodies and the full response pipeline against a
   temporary document root;
-- a **204 checks** live-socket suite that runs the real server and talks
+- a **213 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths
   (the 204 head carrying no Content-Length, per RFC 9110 8.6),
-  absolute-form, suffix and overflowing ranges, 304s, strict If-Range,
+  absolute-form, suffix and overflowing ranges, 304s with their 200's
+  validators, strict If-Range,
   If-Match / If-Unmodified-Since 412s, smuggling rejections, identical
   duplicate Content-Lengths, bare-LF heads, in-tree symlinks served and
   escaping ones refused, the 2047/2048-byte target boundary, mid-sendfile
@@ -241,7 +247,11 @@ the request:
   suffix ranges ignored with a 200, one Range honored but two through
   five ignored, junk dates ignored, control bytes (NUL included) in
   chunk extensions and trailers refused, conditional repeats combined or
-  refused, a differing repeated Expect refused, error responses charged
+  refused, Transfer-Encoding lines combined across lines, a suffix
+  range on an empty file answered 416, the blank-line cap counted
+  across dribbled reads and reset per request, a pipelined head refused
+  before recv when the memory budget cannot fund its buffer - the
+  pending 2 MB response completing first, a differing repeated Expect refused, error responses charged
   to the memory budget and handed back, bodyless error pages to HEAD
   from the pre-parser paths (a capped flood's 431, a budget 503 over a
   buffered head prefix, a stalled head's 408), a 408-response budget

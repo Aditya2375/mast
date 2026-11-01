@@ -345,8 +345,12 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
          * has no LF anywhere yet. (A feed carrying an LF runs the full
          * parse, which also consumes any leading blank lines, so this
          * shortcut never sees them.) */
-        if (!find_lf(p->buf, 0, p->len) && p->len > MAST_MAX_REQUEST_LINE)
-            return bad(p, "414", "the request line grew past 8 KB");
+        if (!find_lf(p->buf, 0, p->len)) {
+            size_t content = p->len;
+            if (content && p->buf[content - 1] == '\r') content--;
+            if (content > MAST_MAX_REQUEST_LINE)
+                return bad(p, "414", "the request line grew past 8 KB");
+        }
         return MAST_PARSE_INCOMPLETE;
     }
     memset(out, 0, sizeof *out);
@@ -357,15 +361,18 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
      * skipped in one iterative pass, so a pile of blank lines costs a
      * single memmove instead of one recursion and memmove per line. */
     size_t blank_skip = 0;
-    int blanks = 0;
+    int settled = 0;   /* a non-empty line followed the blanks */
     for (;;) {
         const char *bnl = find_lf(p->buf, blank_skip, p->len);
         if (!bnl) break;   /* no complete line yet */
         const char *be = bnl;
         if (be > p->buf + blank_skip && be[-1] == '\r') be--;
-        if (be != p->buf + blank_skip) break;   /* a non-empty line */
-        blanks++;
-        if (blanks > 8)
+        if (be != p->buf + blank_skip) { settled = 1; break; }   /* a non-empty line */
+        /* counted on the parser, not per feed: skipped blanks leave the
+         * buffer, so a per-feed count would let a byte-at-a-time dribble
+         * repeat the allowance forever */
+        p->blanks++;
+        if (p->blanks > 8)
             return bad(p, "400", "more than 8 empty lines before the request");
         blank_skip = (size_t)(bnl - p->buf) + 1;
     }
@@ -373,18 +380,25 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
         memmove(p->buf, p->buf + blank_skip, p->len - blank_skip);
         p->len -= blank_skip;
     }
+    /* a non-empty line ends this request's blank run even when an earlier
+     * feed already memmove'd the blanks themselves away */
+    if (settled) p->blanks = 0;   /* the next request counts its own */
 
-    /* request line */
+    /* request line: the 8 KB cap counts its content, not the CRLF */
     const char *nl = find_lf(p->buf, 0, p->len);
     if (!nl) {
-        if (p->len > MAST_MAX_REQUEST_LINE)
+        /* a trailing CR may be the line's own: wait for the LF before
+         * charging it against the cap */
+        size_t content = p->len;
+        if (content && p->buf[content - 1] == '\r') content--;
+        if (content > MAST_MAX_REQUEST_LINE)
             return bad(p, "414", "the request line grew past 8 KB");
         return MAST_PARSE_INCOMPLETE;
     }
-    if (nl - p->buf > MAST_MAX_REQUEST_LINE)
-        return bad(p, "414", "the request line grew past 8 KB");
     const char *eol = nl;
     if (eol > p->buf && eol[-1] == '\r') eol--;   /* strip the optional CR */
+    if (eol - p->buf > MAST_MAX_REQUEST_LINE)
+        return bad(p, "414", "the request line grew past 8 KB");
     size_t line_len = (size_t)(eol - p->buf);
     char *sp1 = memchr(p->buf, ' ', line_len);
     char *sp2 = sp1 ? memchr(sp1 + 1, ' ', line_len - (size_t)(sp1 + 1 - p->buf)) : NULL;
@@ -522,10 +536,15 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
                 if (strcasecmp(tok, "chunked") == 0) nchunked++;
                 else nother++;
             }
-            if (nother)
-                return bad(p, nchunked ? "400" : "501",
-                           nchunked ? "chunked Transfer-Encoding must stand alone"
-                                    : "only chunked Transfer-Encoding is understood");
+            /* RFC 9110 5.3 combines separate TE lines into one list, so
+             * a non-chunked token on any line answers exactly as it would
+             * on one combined line */
+            if (nother) out->te_other = 1;
+            if (out->te_other)
+                return bad(p, (nchunked || out->chunked) ? "400" : "501",
+                           (nchunked || out->chunked)
+                               ? "chunked Transfer-Encoding must stand alone"
+                               : "only chunked Transfer-Encoding is understood");
             if (nchunked == 0)
                 return bad(p, "400", "the Transfer-Encoding list is empty");
             if (nchunked > 1 || out->chunked)
@@ -646,8 +665,9 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
     }
     /* chunked framing: HEXSIZE [;ext] CRLF DATA CRLF ... 0 CRLF [trailers] CRLF.
      * Size and trailer lines straddle feeds, so they buffer into r->line
-     * (1023/4094-byte caps, room for long chunk extensions and legal
-     * trailers) and complete only when the CRLF lands. */
+     * (1023/4094-byte caps including the CRLF - 1021/4092 of content -
+     * room for long chunk extensions and legal trailers) and complete
+     * only when the CRLF lands. */
     size_t i = 0;
     for (;;) {
         if (r->state == MAST_CHUNK_SIZE || r->state == MAST_CHUNK_TRAILER) {

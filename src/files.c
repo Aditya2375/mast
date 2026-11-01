@@ -84,6 +84,9 @@ int mast_range_parse(const char *header, long long size,
          * not unsatisfiable ones: ignore the Range and serve the whole
          * representation (RFC 9110 14.2) */
         if (b <= 0) return 0;
+        /* an empty file has no byte a suffix range could satisfy: b
+         * clamps to 0 and the caller answers 416 (documented in the
+         * README; RFC 9110 14.2 leaves this to implementations) */
         if (b > size) b = size;
         *start = size - b;
         *len = b;

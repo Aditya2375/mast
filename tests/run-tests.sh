@@ -14,6 +14,7 @@ trap 'rm -rf "$ROOT"; for p in ${SPID:-} ${SPID2:-} ${SPID3:-} ${SPID4:-} ${SPID
 
 printf '<h1>hi</h1>\n' > "$ROOT/index.html"
 printf 'plain text\n' > "$ROOT/a.txt"
+: > "$ROOT/empty.txt"
 mkdir "$ROOT/sub"
 printf 'sub index\n' > "$ROOT/sub/index.html"
 dd if=/dev/urandom of="$ROOT/big.bin" bs=1024 count=256 2>/dev/null
@@ -503,6 +504,8 @@ r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-99999999999999999
 ok(status(r) == 206 and r.endswith(b"plain text\n"), "overflowing last-byte-pos clamps to 206")
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=99999999999999999999999-\r\n\r\n")
 ok(status(r) == 416, "overflowing first-byte-pos is 416")
+r = request(b"GET /empty.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=-5\r\n\r\n")
+ok(status(r) == 416, "a suffix range on an empty file is 416 (no byte to satisfy)")
 
 # --- round 3: symlinks: inside the tree served, escaping refused ---
 r = request(b"GET /link.txt HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -906,6 +909,37 @@ s.close()
 r = request(b"\r\n\r\nGET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 200, "two leading blank lines still tolerated")
 
+# --- round 12: the blank-line cap counts across dribbled feeds ---
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+for _ in range(8):
+    s.sendall(b"\r\n")
+    time.sleep(0.02)
+s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
+head, body, rest = read_response(s)
+ok(head.startswith(b"HTTP/1.1 200"), "eight dribbled blank lines stay within the cap")
+for _ in range(8):
+    s.sendall(b"\r\n")
+    time.sleep(0.02)
+s.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
+head, body, rest = read_response(s)
+ok(head.startswith(b"HTTP/1.1 200"), "the next request counts its own blank lines")
+s.close()
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+for _ in range(9):
+    s.sendall(b"\r\n")
+    time.sleep(0.02)
+r = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        r += chunk
+except socket.timeout:
+    pass
+ok(r.startswith(b"HTTP/1.1 400"), "a ninth dribbled blank line is a 400")
+s.close()
+
 # --- round 5: absolute-form with a query and no path serves / ---
 r = request(b"GET http://x?q=1 HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 200 and b"<h1>hi</h1>" in r, "absolute-form query without path serves /")
@@ -919,6 +953,10 @@ r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked,\r\n\
 ok(status(r) == 200 and r.endswith(b"hello"), "Transfer-Encoding: chunked, (trailing comma) echoes")
 r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
 ok(status(r) == 400, "gzip+chunked stays rejected")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n0\r\n\r\n")
+ok(status(r) == 400, "TE split across lines combines: chunked + gzip is 400 (RFC 9110 5.3)")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: deflate\r\n\r\n0\r\n\r\n")
+ok(status(r) == 501, "two non-chunked TE lines stay a 501")
 
 # --- round 5: an impossible date is not a date; the precondition is ignored ---
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Tue, 31 Feb 2026 08:49:37 GMT\r\n\r\n")
@@ -1151,6 +1189,44 @@ for sc in held3:
 time.sleep(0.5)
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
 ok(status(r) == 200, "server healthy after the backlog-503 pair")
+
+# --- round 12: budget pressure sizes the read; a pending flush never drops bytes ---
+# the same ~6 KB headroom fill as the backlog-503 pair; the pipelined
+# second head's parser doubling does not fit, so the server must refuse
+# before recv - taking the batch and dropping it would splice the head
+held6 = []
+for k in range(15):
+    sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+    sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 1048575\r\n\r\n" + b"z" * 100)
+    held6.append(sc)
+sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 977024\r\n\r\n" + b"z" * 100)
+held6.append(sc)
+time.sleep(0.4)
+sx = socket.create_connection(("127.0.0.1", port8), timeout=15)
+sx.sendall(b"GET /two-mb.bin HTTP/1.1\r\nHost: x\r\n\r\n"
+           b"GET /a.txt HTTP/1.1\r\nHost: x\r\nX-Pad: " + b"p" * 5000 + b"\r\n\r\n")
+head1, body1, rest = read_response(sx)
+ok(head1.startswith(b"HTTP/1.1 200") and len(body1) == 2000000,
+   "the pending 2 MB response completes under budget pressure")
+sx.settimeout(8)
+r2 = rest
+try:
+    while True:
+        chunk = sx.recv(65536)
+        if not chunk:
+            break
+        r2 += chunk
+except socket.timeout:
+    pass
+ok(r2.startswith(b"HTTP/1.1 503") and b"out of buffer room" in r2,
+   "the refused pipelined head gets a clean 503, not a splice")
+sx.close()
+for sc in held6:
+    sc.close()
+time.sleep(0.5)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
+ok(status(r) == 200, "server healthy after the sized-read refusal")
 
 # --- round 9: the /echo budget pre-check projects the response doubling ---
 # 14 max-size bodies plus one tuner leave a headroom that fits a 400 KB

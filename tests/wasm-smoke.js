@@ -263,6 +263,9 @@ factory({}).then(m => {
     r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-None-Match: \"nope\", " + etag + "\r\n\r\n");
     ok(statusOf(r) === 304 && r.includes("ETag:") && r.includes("Last-Modified:"),
        "wasm: If-None-Match list matches a member, with the 200's validators");
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\n"
+                + "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n0\r\n\r\n");
+    ok(statusOf(r) === 400, "wasm: TE split across lines combines into a 400");
     c = newConn();
     r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nRange: bytes=0-4\r\nIf-Range: \"stale\"\r\n\r\n");
     ok(statusOf(r) === 200, "wasm: If-Range with a stale validator serves the full body");

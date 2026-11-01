@@ -52,6 +52,8 @@ typedef struct {
     const char *connection;  /* raw value, for keep-alive decisions */
     long long content_length;     /* -1 when absent */
     int chunked;                  /* Transfer-Encoding: chunked */
+    int te_other;                 /* a non-chunked TE token on any TE line:
+                         * RFC 9110 5.3 combines the lines into one list */
     int expect_continue;          /* Expect: 100-continue */
     const char *expect;           /* first Expect value: a differing repeat is a 400 */
     int conn_close, conn_keep_alive;   /* exact Connection tokens seen */
@@ -77,6 +79,8 @@ typedef struct {
     char err_status[4]; /* "400", "408", ... when MAST_PARSE_BAD */
     char err_why[96];   /* one-line reason for the error page/log */
     int err_head_method; /* the failed request line was HEAD: no body */
+    int blanks;         /* empty lines skipped before this request, counted
+                         * across feeds so dribbling cannot dodge the cap */
 } MastParser;
 
 void mast_parser_init(MastParser *p);

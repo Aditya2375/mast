@@ -66,6 +66,8 @@ typedef struct {
     int have_head;          /* the request line + headers are parsed */
     MastResponse resp;
     size_t out_sent;        /* bytes of resp.head/mem written */
+    int interim_buffered;   /* a 100-continue remainder sits in resp.head */
+    size_t interim_sent;    /* of it: bytes already on the wire */
     int responding;
     int peer_done;      /* the peer sent FIN: answer, then close */
     long long file_sent;
@@ -190,8 +192,15 @@ static void conn_next_request(Conn *c) {
     c->req_start_ms = c->body_start_ms = c->resp_start_ms = 0;
 }
 
-/* Mark the response phase: the absolute write deadline counts from here. */
+/* Mark the response phase: the absolute write deadline counts from here.
+ * A buffered 100-continue remainder sits ahead of the final response in
+ * resp.head; its already-sent prefix must not be written twice. */
 static void enter_write(Conn *c) {
+    if (c->interim_buffered) {
+        c->out_sent = c->interim_sent;
+        c->interim_sent = 0;
+        c->interim_buffered = 0;
+    }
     c->state = CONN_WRITE;
     c->resp_start_ms = now_ms();
 }
@@ -205,9 +214,11 @@ static void enter_write(Conn *c) {
 static int conn_flush(Conn *c) {
     while (c->out_sent < c->resp.head.len + c->resp.mem.len) {
         /* the turn budget bounds one response's write as well, not just
-         * the pipelined count: past it, finish on a later pass (the
+         * the pipelined count: each send is clamped to what is left of
+         * it, and past it the response finishes on a later pass (the
          * caller marks the connection yielded) */
         if (c->turn_bytes >= TURN_MAX_BYTES) return 0;
+        size_t tleft = (size_t)(TURN_MAX_BYTES - c->turn_bytes);
         const char *p;
         size_t n;
         if (c->out_sent < c->resp.head.len) {
@@ -217,6 +228,7 @@ static int conn_flush(Conn *c) {
             p = c->resp.mem.buf + (c->out_sent - c->resp.head.len);
             n = c->resp.mem.len - (c->out_sent - c->resp.head.len);
         }
+        if (n > tleft) n = tleft;
         ssize_t w = send(c->fd, p, n, MSG_NOSIGNAL);
         if (w < 0) {
             if (errno == EINTR) continue;
@@ -232,6 +244,9 @@ static int conn_flush(Conn *c) {
         if (c->turn_bytes >= TURN_MAX_BYTES) return 0;
         off_t off = (off_t)(c->resp.file_off + c->file_sent);
         size_t want = (size_t)(c->resp.file_len - c->file_sent);
+        size_t tleft = (size_t)(TURN_MAX_BYTES - c->turn_bytes);
+        if (want > tleft) want = tleft;   /* one sendfile cannot spend the
+                                           * whole budget of a later pass */
         ssize_t w = sendfile(c->fd, c->resp.file.fd, &off, want);
         if (w < 0) {
             if (errno == EINTR) continue;
@@ -300,6 +315,8 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
                         size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                         mast_buf_put(&c->resp.head, interim + w, sizeof interim - 1 - (size_t)w);
                         dyn_charge_resp(c, oh, om);
+                        c->interim_buffered = 1;
+                        c->interim_sent = 0;
                     }
                     c->last_ms = now_ms();
                 } else if (oversize) {
@@ -469,10 +486,41 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
             c->resp.status = status;
             c->resp.close_after = 1;
             c->responding = 1;
-            c->state = CONN_WRITE;
+            enter_write(c);
             return 1;
         }
         size_t room = cap - c->parser.len;
+        /* Size the read by the parser growth the -M budget can still
+         * fund, doubling exactly like mast_parser_append. Bytes received
+         * and then refused would have to be dropped, and a truncated head
+         * could splice a prefix into a different request - so when the
+         * budget can fund nothing, refuse before recv and let the bytes
+         * wait in the kernel. */
+        {
+            size_t slack = dyn_budget(cfg) > g_dyn_bytes
+                ? dyn_budget(cfg) - g_dyn_bytes : 0;
+            size_t funded = c->parser.cap;
+            while (funded < c->parser.len + room) {
+                size_t next = funded ? funded * 2 : 4096;
+                if (next < funded || next - c->parser.cap > slack) break;
+                funded = next;
+            }
+            size_t avail = funded > c->parser.len ? funded - c->parser.len : 0;
+            if (room > avail) room = avail;
+        }
+        if (room == 0) {
+            if (pending) return 1;   /* flush first; the bytes wait */
+            size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
+            mast_reply_error(&c->resp.head, err_to_head(c) ? NULL : &c->resp.mem,
+                             503, "the server is out of buffer room, retry shortly",
+                             "Retry-After: 1\r\n", 0);
+            dyn_charge_resp(c, oh, om);
+            c->resp.status = 503;
+            c->resp.close_after = 1;
+            c->responding = 1;
+            enter_write(c);
+            return 1;
+        }
         ssize_t r = recv(c->fd, tmp, room < sizeof tmp ? room : sizeof tmp, 0);
         if (r <= 0) {
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
@@ -492,6 +540,8 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
             size_t ptarget = c->parser.cap ? c->parser.cap : 4096;
             while (ptarget < pneed) ptarget *= 2;
             size_t pgrow = ptarget - c->parser.cap;
+            /* unreachable while the pre-recv sizing above holds; kept as
+             * the invariant's guard */
             if (pgrow && g_dyn_bytes + pgrow > dyn_budget(cfg)) {
                 if (pending) return 1;   /* let the pending answer flush first */
                 size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
@@ -502,7 +552,7 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
                 c->resp.status = 503;
                 c->resp.close_after = 1;
                 c->responding = 1;
-                c->state = CONN_WRITE;
+                enter_write(c);
                 return 1;
             }
         }
@@ -578,6 +628,24 @@ static int conn_service(Conn *c, const MastConfig *cfg, uint32_t events) {
             return 1;
         if (now_ms() >= c->drain_deadline) return 1;
         return 0;
+    }
+    if ((events & EPOLLOUT) && c->state == CONN_READ_BODY && c->interim_buffered) {
+        /* the client waits for the 100-continue before it will ever send
+         * the body: flush the remainder on writability instead of
+         * holding it hostage to the final response */
+        while (c->interim_sent < c->resp.head.len) {
+            ssize_t w = send(c->fd, c->resp.head.buf + c->interim_sent,
+                             c->resp.head.len - c->interim_sent, MSG_NOSIGNAL);
+            if (w > 0) { c->interim_sent += (size_t)w; c->last_ms = now_ms(); continue; }
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            return 1;   /* dead mid-interim */
+        }
+        if (c->interim_sent == c->resp.head.len) {
+            c->resp.head.len = 0;
+            c->interim_sent = 0;
+            c->interim_buffered = 0;
+        }
     }
     if ((events & (EPOLLIN | EPOLLRDHUP)) &&
         (c->state == CONN_READ_HEAD || c->state == CONN_READ_BODY)) {
@@ -879,7 +947,11 @@ int mast_serve(const MastConfig *cfg) {
                 /* a head or body that timed out mid-request still gets a
                  * 408 when nothing was written yet; a merely idle or a
                  * silent connection closes quietly */
-                if (!g_stop && !c->responding && c->resp.head.len == 0 &&
+                /* a buffered 100-continue is not the final response: the
+                 * 408 appends after it, in wire order (enter_write keeps
+                 * its sent prefix from being written twice) */
+                if (!g_stop && !c->responding &&
+                    (c->resp.head.len == 0 || c->interim_buffered) &&
                     (c->state == CONN_READ_BODY || c->parser.len > 0)) {
                     size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                     mast_reply_error(&c->resp.head, err_to_head(c) ? NULL : &c->resp.mem,
@@ -888,7 +960,7 @@ int mast_serve(const MastConfig *cfg) {
                     c->resp.status = 408;
                     c->resp.close_after = 1;
                     c->responding = 1;
-                    c->state = CONN_WRITE;
+                    enter_write(c);
                     c->last_ms = t;   /* the write timeout now governs */
                     struct epoll_event cev;
                     memset(&cev, 0, sizeof cev);

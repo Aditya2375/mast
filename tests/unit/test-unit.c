@@ -202,9 +202,73 @@ int main(void) {
     CHECK(parse("GET http://x?q=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && strcmp(q.target, "/?q=1") == 0,
           "absolute-form with a query and no path keeps the query on the target");
+    {
+        MastParser p;
+        mast_parser_init(&p);
+        const char *te1 = "POST /echo HTTP/1.1\r\nHost: x\r\n"
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n";
+        CHECK(mast_parser_feed(&p, te1, strlen(te1), &q, &used) == MAST_PARSE_BAD
+              && memcmp(p.err_status, "400", 3) == 0,
+              "TE on two lines combines: chunked + gzip is a 400");
+        mast_parser_free(&p);
+        mast_parser_init(&p);
+        const char *te2 = "POST /echo HTTP/1.1\r\nHost: x\r\n"
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: deflate\r\n\r\n";
+        CHECK(mast_parser_feed(&p, te2, strlen(te2), &q, &used) == MAST_PARSE_BAD
+              && memcmp(p.err_status, "501", 3) == 0,
+              "two non-chunked TE lines stay a 501");
+        mast_parser_free(&p);
+    }
     CHECK(parse("GET http://x/a.txt?q=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && strcmp(q.path, "/a.txt") == 0 && strcmp(q.authority, "x") == 0,
           "absolute-form keeps the path and drops the query");
+
+    /* the blank-line cap counts across feeds, and resets per request */
+    {
+        MastParser p;
+        mast_parser_init(&p);
+        MastParse r = MAST_PARSE_INCOMPLETE;
+        for (int k = 0; k < 9 && r == MAST_PARSE_INCOMPLETE; k++)
+            r = mast_parser_feed(&p, "\r\n", 2, &q, &used);
+        CHECK(r == MAST_PARSE_BAD && memcmp(p.err_status, "400", 3) == 0,
+              "nine blank lines one feed at a time still hit the cap");
+        mast_parser_free(&p);
+        mast_parser_init(&p);
+        r = MAST_PARSE_INCOMPLETE;
+        for (int k = 0; k < 8 && r == MAST_PARSE_INCOMPLETE; k++)
+            r = mast_parser_feed(&p, "\r\n", 2, &q, &used);
+        CHECK(r == MAST_PARSE_INCOMPLETE, "eight dribbled blanks stay within the cap");
+        const char *req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        CHECK(mast_parser_feed(&p, req, strlen(req), &q, &used)
+              == MAST_PARSE_OK, "the request after the blanks parses");
+        /* the caller consumes the parsed head, as conn_process does */
+        memmove(p.buf, p.buf + used, p.len - used);
+        p.len -= used;
+        r = MAST_PARSE_INCOMPLETE;
+        for (int k = 0; k < 8 && r == MAST_PARSE_INCOMPLETE; k++)
+            r = mast_parser_feed(&p, "\r\n", 2, &q, &used);
+        CHECK(r == MAST_PARSE_INCOMPLETE,
+              "the next request counts its own blank lines");
+        mast_parser_free(&p);
+    }
+
+    /* the 8 KB request-line cap counts content, not the CRLF */
+    {
+        static char big[8200];
+        MastParser p;
+        mast_parser_init(&p);
+        memset(big, 'X', 8193);
+        big[8192] = '\r';
+        CHECK(mast_parser_feed(&p, big, 8193, &q, &used) == MAST_PARSE_INCOMPLETE,
+              "8192 content bytes plus a pending CR wait for the LF");
+        mast_parser_free(&p);
+        mast_parser_init(&p);
+        big[8192] = 'X'; big[8193] = '\r';
+        CHECK(mast_parser_feed(&p, big, 8194, &q, &used) == MAST_PARSE_BAD
+              && memcmp(p.err_status, "414", 3) == 0,
+              "8193 content bytes are a 414");
+        mast_parser_free(&p);
+    }
 
     /* fragmentation: the same request byte-by-byte must parse identically */
     {

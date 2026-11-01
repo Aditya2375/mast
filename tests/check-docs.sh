@@ -33,6 +33,8 @@ src/files.c|O_NOFOLLOW|symlink
 src/server.c|c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem|A response to HEAD never carries a body
 tests/fuzz.py|--programs., type=int, default=100|default 100 programs
 tests/fuzz.py|--blobs., type=int, default=200|200 blobs
+src/http.c|MAST_CHUNK_SIZE ? 1023|chunk-size lines of 1021
+src/http.h|line\[4096\]|trailer lines of 4092
 "
 printf '%s' "$pins" | while IFS='|' read -r file src_pat doc_pat; do
     [ -n "$file" ] || continue
