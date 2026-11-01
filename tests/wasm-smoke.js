@@ -99,6 +99,8 @@ factory({}).then(m => {
     ok(vjs && vjs === vw && vjs === wasmHash, "demo: cache-busters match the wasm hash");
     ok(html.includes("sendBtn.addEventListener") && html.includes("mast_recv"),
        "demo: send path wired to mast_recv");
+    ok(/replace\(\/\\r\?\\n\/g, ['"]\\r\\n['"]\)/.test(html),
+       "demo: textarea LF is normalized back to CRLF on the wire");
     ok((html.match(/disabled><\/select>/) || html.includes('id="preset" disabled')) &&
        html.includes('id="send" disabled'), "demo: controls start disabled until boot");
 

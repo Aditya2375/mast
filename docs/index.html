@@ -107,8 +107,10 @@ function newConn(){
 }
 
 function send(){
-  const text = req.value;
-  const bytes = new TextEncoder().encode(text);
+  /* textarea values normalize CRLF to LF; put the CRLF back so the wire
+     bytes are real HTTP (and the display shows what the server sees) */
+  const wire = req.value.replace(/\r?\n/g, '\r\n');
+  const bytes = new TextEncoder().encode(wire);
   const ptr = M._malloc(Math.max(bytes.length, 1));
   if (!ptr) { line('mast: out of memory sending the request\n', 'err'); return; }
   M.writeArrayToMemory(bytes, ptr);
