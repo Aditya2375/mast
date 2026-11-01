@@ -199,6 +199,9 @@ int main(void) {
     CHECK(parse("GET http://x?q=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && strcmp(q.path, "/") == 0 && strcmp(q.authority, "x") == 0,
           "absolute-form with a query and no path serves /");
+    CHECK(parse("GET http://x?q=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && strcmp(q.target, "/?q=1") == 0,
+          "absolute-form with a query and no path keeps the query on the target");
     CHECK(parse("GET http://x/a.txt?q=1 HTTP/1.1\r\nHost: x\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && strcmp(q.path, "/a.txt") == 0 && strcmp(q.authority, "x") == 0,
           "absolute-form keeps the path and drops the query");

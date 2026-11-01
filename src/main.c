@@ -1,4 +1,6 @@
-/* main.c - the CLI: mast [-d docroot] [-p port] [-c max-connections].
+/* main.c - the CLI: mast [-d docroot] [-p port] [-c max-connections]
+ * [-H header-ms] [-I idle-ms] [-B body-ms] [-W write-ms] [-R requests]
+ * [-A age-ms] [-M megabytes].
  * Prints the exact, honest usage and dies on any misuse with exit 2. */
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -13,6 +15,8 @@ static void usage(FILE *f) {
     fprintf(f,
         "mast - a small HTTP/1.1 static file server\n"
         "usage: mast [-d docroot] [-p port] [-c max-connections]\n"
+        "              [-H header-ms] [-I idle-ms] [-B body-ms] [-W write-ms]\n"
+        "              [-R requests] [-A age-ms] [-M megabytes]\n"
         "  -d docroot          directory to serve (default: .)\n"
         "  -p port             port to listen on (default: 8080)\n"
         "  -c max-connections  simultaneous connection cap (default: 1024)\n"

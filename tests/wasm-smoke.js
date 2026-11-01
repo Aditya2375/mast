@@ -158,6 +158,7 @@ factory({}).then(m => {
     c = newConn();
     r = send(c, "OPTIONS * HTTP/1.1\r\nHost: demo\r\n\r\n");
     ok(statusOf(r) === 204 && r.includes("Allow: GET, HEAD, POST, OPTIONS"), "wasm: OPTIONS * is 204 with Allow");
+    ok(!r.split("\r\n\r\n")[0].includes("Content-Length"), "wasm: the 204 head has no Content-Length");
 
     c = newConn();
     r = send(c, "OPTIONS /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");

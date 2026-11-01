@@ -31,13 +31,15 @@ src/server.c|header_timeout_ms|header timeout
 src/server.c|sendfile|sendfile
 src/files.c|O_NOFOLLOW|symlink
 src/server.c|c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem|A response to HEAD never carries a body
+tests/fuzz.py|--programs., type=int, default=100|default 100 programs
+tests/fuzz.py|--blobs., type=int, default=200|200 blobs
 "
 printf '%s' "$pins" | while IFS='|' read -r file src_pat doc_pat; do
     [ -n "$file" ] || continue
-    if ! grep -q "$src_pat" "$file"; then
+    if ! grep -q -- "$src_pat" "$file"; then
         echo "check-docs: enforcing code missing: $src_pat in $file"; exit 1
     fi
-    if ! grep -q "$doc_pat" README.md; then
+    if ! grep -q -- "$doc_pat" README.md; then
         echo "check-docs: README does not document: $doc_pat"; exit 1
     fi
 done || fail=1

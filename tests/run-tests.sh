@@ -333,6 +333,8 @@ ok(status(r) == 404 and not r.startswith(b"HTTP/1.1 100"),
 # --- OPTIONS * and absolute-form ---
 r = request(b"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 204 and b"Allow: GET, HEAD, POST, OPTIONS" in r, "OPTIONS * is 204 with Allow")
+ok(b"Content-Length" not in r.split(b"\r\n\r\n")[0],
+   "the 204 head carries no Content-Length (RFC 9110 8.6)")
 r = request(b"GET http://x/a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
 ok(status(r) == 200 and b"plain text" in r, "absolute-form serves its path")
 r = request(b"GET http://a/a.txt HTTP/1.1\r\nHost: b\r\n\r\n")
@@ -572,6 +574,26 @@ ok(data503.startswith(b"HTTP/1.1 503") and b"Connection: close" in data503,
    "a full server answers 503, not an RST")
 ok(b"\r\nDate: " in data503 and b"\r\nServer: mast\r\n" in data503,
    "the at-cap 503 carries Date and Server like every other response")
+for h in held:
+    h.close()
+time.sleep(0.3)
+held = [socket.create_connection(("127.0.0.1", port4), timeout=3) for _ in range(4)]
+time.sleep(0.7)
+s503b = socket.create_connection(("127.0.0.1", port4), timeout=3)
+s503b.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")   # request in flight before the answer
+s503b.settimeout(4)
+full503 = b""
+try:
+    while True:
+        chunk = s503b.recv(4096)
+        if not chunk:
+            break
+        full503 += chunk
+except (socket.timeout, ConnectionResetError):
+    pass
+s503b.close()
+ok(full503.startswith(b"HTTP/1.1 503") and full503.endswith(b"try again later\n"),
+   "the at-cap 503 arrives complete with the client's request unread")
 for h in held:
     h.close()
 time.sleep(0.3)
@@ -1383,6 +1405,10 @@ ok(ledger_ok and status(r) == 200, "20 echo-then-400 cycles leave the budget led
 # -M validation
 p = subprocess.run([binpath, "-d", root, "-M", "5"], capture_output=True)
 ok(p.returncode == 2, "-M below the range is a usage error")
+p = subprocess.run([binpath, "-h"], capture_output=True)
+ok(p.returncode == 0 and b"-M megabytes" in p.stdout and b"-H header-ms" in p.stdout
+   and b"-R requests" in p.stdout,
+   "the usage text names every flag")
 
 # concurrency: 50 simultaneous clients
 

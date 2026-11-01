@@ -193,6 +193,15 @@ int mast_recv(DemoConn *c, const char *data, int n) {
                 memmove(c->parser.buf, c->parser.buf + bc, c->parser.len - bc);
                 c->parser.len -= bc;
                 if (br == MAST_BODY_INCOMPLETE) break;
+                if (br == MAST_BODY_NOMEM) {
+                    /* same contract as the socket server (ABORTING_MALLOC
+                     * makes this unreachable in practice) */
+                    mast_reply_error(&c->out, &c->out, 503,
+                        "the server is out of buffer room, retry shortly",
+                        "Retry-After: 1\r\n", 0);
+                    c->closed = 1;
+                    return 0;
+                }
                 if (br == MAST_BODY_TOO_LARGE || br == MAST_BODY_BAD) {
                     mast_reply_error(&c->out,
                         c->req.method == MAST_METHOD_HEAD ? NULL : &c->out,

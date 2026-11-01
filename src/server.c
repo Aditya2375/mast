@@ -38,16 +38,17 @@ typedef enum {
 /* Lingering closes share a small budget, so clients that never FIN cannot
  * pin every connection slot in the drain state. */
 #define DRAIN_MAX_SHARE 4    /* of max_conn, capped at 16 */
+#define OVERFLOW_SLOTS 4     /* at-cap 503s get the full flush + linger machinery */
 #define SHUTDOWN_GRACE_MS 5000   /* in-flight writes get this, then exit */
 
 static int g_drainers = 0;
 
 /* Total bytes held in per-connection dynamic buffers (parse backlog,
  * request bodies and response heads/pages). Bounded by the -M budget: a
- * connection that
- * would push past it gets a 503 and closes instead of growing without
- * limit, and a failed allocation fails that one connection, never the
- * process. */
+ * connection that would push past it gets a 503 and closes instead of
+ * growing without limit. A genuinely failed allocation means the host
+ * itself is out of memory, which no static server survives usefully:
+ * the allocators exit(70) then (see Honest limits in the README). */
 static size_t g_dyn_bytes = 0;
 
 static size_t dyn_budget(const MastConfig *cfg) {
@@ -76,6 +77,7 @@ typedef struct {
     int turn_responses;     /* completed this loop pass (fairness) */
     long long turn_bytes;   /* written this loop pass (fairness) */
     int yielded;            /* budget spent with work pending: re-run */
+    int overflow;           /* accepted past -c to answer a lingered 503 */
     size_t dyn_counted;     /* bytes this conn added to g_dyn_bytes */
     size_t parser_counted;  /* of parser.cap: the part already in g_dyn_bytes */
     int head_waiting;       /* last head parse said INCOMPLETE: skip
@@ -156,7 +158,8 @@ static void log_access(Conn *c) {
     inet_ntop(AF_INET, &c->peer.sin_addr, ip, sizeof ip);
     long long bytes = (long long)c->resp.head.len + c->resp.mem.len + c->file_sent;
     fprintf(stdout, "%s ", ip);
-    log_escaped(c->req.method_raw);
+    if (c->req.method_raw[0]) log_escaped(c->req.method_raw);
+    else fputc('-', stdout);
     fputc(' ', stdout);
     if (c->req.target) log_escaped(c->req.target); else fputc('-', stdout);
     fprintf(stdout, " -> %d (%lld bytes, %lld ms)\n",
@@ -648,9 +651,10 @@ int mast_serve(const MastConfig *cfg) {
     lev.data.fd = lfd;
     if (epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &lev) < 0) { perror("epoll_ctl"); return 1; }
 
-    Conn **conns = calloc((size_t)cfg->max_conn, sizeof *conns);
+    const int slots = cfg->max_conn + OVERFLOW_SLOTS;
+    Conn **conns = calloc((size_t)slots, sizeof *conns);
     if (!conns) { fprintf(stderr, "mast: out of memory\n"); return 70; }
-    int nconn = 0;
+    int nconn = 0, noverflow = 0;
     fprintf(stdout, "mast: serving %s on http://0.0.0.0:%d (%d max connections)\n",
             cfg->docroot_real, cfg->port, cfg->max_conn);
     fflush(stdout);
@@ -658,7 +662,7 @@ int mast_serve(const MastConfig *cfg) {
     struct epoll_event evs[128];
     int work_pending = 0;   /* a yielded connection is owed another pass */
     long long stop_since = 0;   /* when shutdown began, for the grace cap */
-    while (!g_stop || nconn > 0) {
+    while (!g_stop || nconn + noverflow > 0) {
         int nev = epoll_wait(ep, evs, 128, g_stop ? 100 : (work_pending ? 0 : 500));
         if (nev < 0) {
             if (errno == EINTR) continue;
@@ -682,8 +686,46 @@ int mast_serve(const MastConfig *cfg) {
                         break;   /* EAGAIN: the edge is drained */
                     }
                     if (nconn >= cfg->max_conn) {
-                        /* full: say so best-effort, then close - a silent
-                         * RST would look like a network fault */
+                        /* full: answer 503 through the usual machinery -
+                         * a normal flush, then a lingering close that
+                         * drains the unread request, so a well-behaved
+                         * client never loses the answer to an RST. Only
+                         * when every overflow slot is busy, fall back to
+                         * one best-effort write. */
+                        Conn *c = calloc(1, sizeof *c);
+                        int slot = -1;
+                        for (int k = cfg->max_conn; k < slots; k++)
+                            if (!conns[k]) { slot = k; break; }
+                        if (c && slot >= 0) {
+                            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                            c->fd = cfd;
+                            c->peer = peer;
+                            c->overflow = 1;
+                            mast_parser_init(&c->parser);
+                            mast_response_init(&c->resp);
+                            c->started_ms = c->last_ms = now_ms();
+                            mast_reply_error(&c->resp.head, &c->resp.mem, 503,
+                                             "the server is full - try again later", NULL, 0);
+                            dyn_charge_resp(c, 0, 0);
+                            c->resp.status = 503;
+                            c->resp.close_after = 1;
+                            c->responding = 1;
+                            enter_write(c);
+                            struct epoll_event cev;
+                            memset(&cev, 0, sizeof cev);
+                            cev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+                            cev.data.ptr = c;
+                            if (epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &cev) == 0) {
+                                conns[slot] = c;
+                                noverflow++;
+                                continue;
+                            }
+                            conn_free(c);
+                            free(c);
+                        } else if (c) {
+                            free(c);
+                        }
+                        /* last resort: one write, then close */
                         static const char body[] =
                             "503 Service Unavailable\nthe server is full - try again later\n";
                         char busy[512];
@@ -731,29 +773,29 @@ int mast_serve(const MastConfig *cfg) {
             }
             Conn *c = evs[i].data.ptr;
             if (conn_service(c, cfg, evs[i].events)) {
-                for (int k = 0; k < cfg->max_conn; k++)
+                for (int k = 0; k < slots; k++)
                     if (conns[k] == c) { conns[k] = NULL; break; }
                 if (c->state == CONN_DRAIN_CLOSE) g_drainers--;
                 epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                if (c->overflow) noverflow--; else nconn--;
                 conn_free(c);
                 free(c);
-                nconn--;
             }
         }
         /* fairness pass: every yielded connection gets one fresh budget
          * after the others had their turn */
         work_pending = 0;
-        for (int k = 0; k < cfg->max_conn; k++) {
+        for (int k = 0; k < slots; k++) {
             Conn *c = conns[k];
             if (!c || !c->yielded) continue;
             c->yielded = 0;
             if (conn_service(c, cfg, EPOLLIN | EPOLLOUT)) {
                 if (c->state == CONN_DRAIN_CLOSE) g_drainers--;
                 epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                if (c->overflow) noverflow--; else nconn--;
                 conn_free(c);
                 free(c);
                 conns[k] = NULL;
-                nconn--;
             } else if (c->yielded) {
                 work_pending = 1;
             }
@@ -769,7 +811,7 @@ int mast_serve(const MastConfig *cfg) {
              * process up to the full write timeout */
             if (t - stop_since > SHUTDOWN_GRACE_MS) break;
         }
-        for (int k = 0; k < cfg->max_conn; k++) {
+        for (int k = 0; k < slots; k++) {
             Conn *c = conns[k];
             if (!c) continue;
             if (c->state == CONN_DRAIN_CLOSE) {
@@ -779,10 +821,10 @@ int mast_serve(const MastConfig *cfg) {
                     t - c->started_ms > cfg->max_age_ms) {
                     g_drainers--;
                     epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                    if (c->overflow) noverflow--; else nconn--;
                     conn_free(c);
                     free(c);
                     conns[k] = NULL;
-                    nconn--;
                 }
                 continue;
             }
@@ -790,19 +832,19 @@ int mast_serve(const MastConfig *cfg) {
                 /* shutdown: idle and half-read connections close at once;
                  * only in-flight responses finish writing */
                 epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                if (c->overflow) noverflow--; else nconn--;
                 conn_free(c);
                 free(c);
                 conns[k] = NULL;
-                nconn--;
                 continue;
             }
             /* no connection outlives its age cap, whatever its phase */
             if (t - c->started_ms > cfg->max_age_ms) {
                 epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                if (c->overflow) noverflow--; else nconn--;
                 conn_free(c);
                 free(c);
                 conns[k] = NULL;
-                nconn--;
                 continue;
             }
             /* every phase has both a stall timeout (refreshed by real
@@ -850,13 +892,13 @@ int mast_serve(const MastConfig *cfg) {
                     continue;
                 }
                 epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                if (c->overflow) noverflow--; else nconn--;
                 conn_free(c);
                 free(c);
                 conns[k] = NULL;
-                nconn--;
             }
         }
-        if (g_stop && nconn == 0) break;
+        if (g_stop && nconn + noverflow == 0) break;
     }
     epoll_ctl(ep, EPOLL_CTL_DEL, lfd, NULL);
     close(lfd);

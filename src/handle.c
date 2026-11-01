@@ -62,9 +62,11 @@ void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse
         mast_buf_puts(&r->head, "HTTP/1.1 204 No Content\r\n");
         char date[MAST_DATE_LEN];
         mast_http_date(date, (int64_t)time(NULL));
+        /* RFC 9110 8.6: a 204 head MUST NOT carry Content-Length -
+         * the status code itself ends the response */
         mast_buf_printf(&r->head, "Date: %s\r\nServer: mast\r\n"
                         "Allow: GET, HEAD, POST, OPTIONS\r\n"
-                        "Content-Length: 0\r\nConnection: %s\r\n\r\n",
+                        "Connection: %s\r\n\r\n",
                         date, ka ? "keep-alive" : "close");
         r->status = 204;
         r->close_after = !ka;

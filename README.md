@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2485 lines of C.
+2540 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -129,8 +129,11 @@ the request:
   minutes, lingering closes included, so no connection lives forever no
   matter how politely it behaves (`-R` and `-A` retune both),
 - at most 1024 simultaneous connections (configurable with `-c`); past
-  the cap, new connections get a best-effort 503 instead of a silent
-  reset. Keep `-c` comfortably below `ulimit -n` (each connection needs a
+  the cap, a small set of overflow slots answers 503 through the normal
+  machinery - a full flush, then a lingering close that drains the unread
+  request, so a well-behaved client always receives the answer instead of
+  a reset that looks like a network fault. Only when even those slots are
+  busy does mast fall back to one best-effort write before closing. Keep `-c` comfortably below `ulimit -n` (each connection needs a
   file descriptor, plus the listener, epoll and open files); if accept
   still hits EMFILE, the listener re-arms and retries once slots free.
 
@@ -202,16 +205,17 @@ the request:
 
 `make test` runs three layers:
 
-- a **344 checks** unit suite over the parser (including byte-by-byte
+- a **345 checks** unit suite over the parser (including byte-by-byte
   fragmented feeds and a CPU bound on a 26 KB head dribbled in one byte
   at a time through the library feed API - the socket server's side of
   the same guarantee is tested live, below), path sanitizer, ranges,
   dates, chunked bodies and the full response pipeline against a
   temporary document root;
-- a **201 checks** live-socket suite that runs the real server and talks
+- a **204 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
-  100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths,
+  100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths
+  (the 204 head carrying no Content-Length, per RFC 9110 8.6),
   absolute-form, suffix and overflowing ranges, 304s, strict If-Range,
   If-Match / If-Unmodified-Since 412s, smuggling rejections, identical
   duplicate Content-Lengths, bare-LF heads, in-tree symlinks served and
@@ -226,7 +230,7 @@ the request:
   under flood, fast SIGTERM shutdown with idle keep-alive conns while
   in-flight responses complete - capped by a 5-second grace and a second
   signal that forces exit - special files (FIFO, socket, device) as fast
-  404s, blank-line floods, the memory budget refusing with 503 (plain
+  404s, blank-line floods, the usage text naming every flag, the memory budget refusing with 503 (plain
   bodies, a chunked batch whose buffer doubling projects past it, and an
   exact ledger across keep-alive reuse), a dribbled no-LF head never
   blocking other clients - including a 28 KB header line dribbled in one
@@ -245,7 +249,8 @@ the request:
   refused when its projected response doubling would pass the budget,
   two concurrent 2 MB downloads completing byte-exact under the
   per-turn write budget, a lingering close reaped by the age cap, the
-  at-cap 503 carrying Date and Server, EMFILE
+  at-cap 503 carrying Date and Server and arriving complete even with
+  the client's request still unread, EMFILE
   recovery, a root-document-tree server and 50 concurrent clients;
 - `tests/fuzz-sockets.py`, a stateful socket fuzzer: random mutated
   sessions with fragmentation, pipelining, half-closes, RSTs, oversized
@@ -257,7 +262,7 @@ the request:
 
 `make sanitize` reruns the whole suite under AddressSanitizer and
 UndefinedBehaviorSanitizer, and `python3 tests/fuzz.py` throws mutated and
-random byte streams at the parser (default 20 programs, 30 blobs) with the
+random byte streams at the parser (default 100 programs, 200 blobs) with the
 same suite available in a sanitized build.
 
 ## Layout

@@ -427,6 +427,13 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
             out->authority[an] = '\0';
             if (auth[an] == '/') {
                 memmove(out->target_raw, auth + an, strlen(auth + an) + 1);
+            } else if (auth[an] == '?') {
+                /* no path: it means "/", and the query stays attached */
+                size_t ql = strlen(auth + an);   /* includes the '?' */
+                if (ql + 2 > sizeof out->target_raw)
+                    return bad(p, "414", "the request target is over 2048 bytes");
+                memmove(out->target_raw + 1, auth + an, ql + 1);
+                out->target_raw[0] = '/';
             } else {
                 out->target_raw[0] = '/';
                 out->target_raw[1] = '\0';
