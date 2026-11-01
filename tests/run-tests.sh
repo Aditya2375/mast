@@ -57,7 +57,7 @@ PORT8=18108
 SPID8=$!
 sleep 0.4
 
-python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" "$PORT5" "$PORT6" "$PORT7" "$PORT8" <<'PYEOF'
+python3 - "$PORT" "$PORT2" "$PORT3" "$ROOT" "$PORT4" "$BIN" "$PORT5" "$PORT6" "$PORT7" "$PORT8" "$SPID" <<'PYEOF'
 import socket, sys, time, re, os
 import threading
 
@@ -71,6 +71,7 @@ port5 = int(sys.argv[7])
 port6 = int(sys.argv[8])
 port7 = int(sys.argv[9])
 port8 = int(sys.argv[10])
+spid = int(sys.argv[11])
 checks = 0
 fails = 0
 
@@ -1039,6 +1040,101 @@ r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Unmodified-Since: Sun, 06 Nov
 ok(status(r) == 400, "a repeated If-Unmodified-Since is 400")
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Range: " + etag + b"\r\nIf-Range: " + etag + b"\r\nRange: bytes=0-2\r\n\r\n")
 ok(status(r) == 400, "a repeated If-Range is 400")
+
+# --- round 7: a >8 KB dribbled header line stays O(1) per byte on the socket path ---
+def srv_cpu():
+    try:
+        data = open("/proc/%d/stat" % spid).read()
+        rest = data[data.rindex(")") + 2:].split()
+        return (int(rest[11]) + int(rest[12])) / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+cpu0 = srv_cpu()
+bigdrib = socket.create_connection(("127.0.0.1", port), timeout=5)
+bigdrib.sendall(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nX-Pad: ")
+live = True
+for k in range(28 * 1024):
+    bigdrib.sendall(b"y")
+    if k % 7168 == 7167:
+        if not request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n").startswith(b"HTTP/1.1 200"):
+            live = False
+            break
+bigdrib.sendall(b"\r\n\r\n")
+r = b""
+bigdrib.settimeout(5)
+try:
+    while b"\r\n\r\n" not in r:
+        part = bigdrib.recv(4096)
+        if not part:
+            break
+        r += part
+except socket.timeout:
+    pass
+ok(live, "other clients are served during a 28 KB no-LF dribble")
+ok(r.startswith(b"HTTP/1.1 200"), "the 28 KB dribbled header line completes into a 200")
+cpu1 = srv_cpu()
+if cpu0 is not None and cpu1 is not None:
+    ok(cpu1 - cpu0 < 0.150, "server CPU for a 28 KB no-LF dribble is bounded (%.3fs)" % (cpu1 - cpu0))
+bigdrib.close()
+
+# --- round 7: any repeated Range ignores the header, however many lines ---
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n")
+ok(status(r) == 206, "one Range is honored")
+for n in (2, 3, 4, 5):
+    hdrs = b"".join(b"Range: bytes=%d-%d\r\n" % (i, i + 1) for i in range(n))
+    r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n" + hdrs + b"\r\n")
+    ok(status(r) == 200 and r.endswith(b"plain text\n"),
+       "%d Range headers are ignored, full 200" % n)
+
+# --- round 7: an embedded NUL cannot hide control bytes in chunk framing ---
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\x00\x01\x02\r\nhello\r\n0\r\n\r\n")
+ok(status(r) == 400, "a NUL in a chunk size line is 400")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-T: a\x00b\r\n\r\n")
+ok(status(r) == 400, "a NUL in a trailer is 400")
+
+# --- round 7: signed or misshapen date fields are ignored, never honored ---
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 01 Jan 2099 -5:00:00 GMT\r\n\r\n")
+ok(status(r) == 200, "a signed hour is not a date (ignored, not 304)")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 01 Jan 2099 +5:00:00 GMT\r\n\r\n")
+ok(status(r) == 200, "a +-signed hour is not a date either")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 1 Jan 2099 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 200, "an unpadded day is not a date")
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Sun, 01 Jan 2099 08:49:37 GMT\r\n\r\n")
+ok(status(r) == 304, "the well-formed future date still short-circuits")
+
+# --- round 7: a repeated Expect must agree with itself ---
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\nhi")
+ok(b"HTTP/1.1 100 Continue" in r and r.endswith(b"hi"), "identical repeated Expect merges")
+r = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nExpect: 100-continue\r\nExpect: max\r\n\r\nhi")
+ok(status(r) == 400, "a differing repeated Expect is 400")
+
+# --- round 7: error responses are charged to the budget and handed back ---
+ledger_ok = True
+for k in range(20):
+    sc = socket.create_connection(("127.0.0.1", port8), timeout=8)
+    sc.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 900000\r\n\r\n" + b"q" * 900000)
+    sc.settimeout(8)
+    got = b""
+    try:
+        while b"\r\n\r\n" not in got:
+            got += sc.recv(65536)
+    except socket.timeout:
+        pass
+    if not got.startswith(b"HTTP/1.1 200"):
+        ledger_ok = False
+        sc.close()
+        break
+    sc.sendall(b"GET /a.txt HTTP/1.1\r\n\r\n")   # no Host: a 400, then close
+    try:
+        while sc.recv(65536):
+            pass
+    except socket.timeout:
+        pass
+    sc.close()
+time.sleep(0.4)
+r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n", to=port8)
+ok(ledger_ok and status(r) == 200, "20 echo-then-400 cycles leave the budget ledger exact")
 
 # -M validation
 p = subprocess.run([binpath, "-d", root, "-M", "5"], capture_output=True)

@@ -90,6 +90,15 @@ static void dyn_return(Conn *c) {
     c->dyn_counted = 0;
 }
 
+/* Charge a just-built response's buffer growth (head + mem, error pages
+ * and interims included) so the budget ledger sees every byte it will
+ * later hand back. */
+static void dyn_charge_resp(Conn *c, size_t old_hcap, size_t old_mcap) {
+    size_t grew = (c->resp.head.cap - old_hcap) + (c->resp.mem.cap - old_mcap);
+    g_dyn_bytes += grew;
+    c->dyn_counted += grew;
+}
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) {
     (void)sig;
@@ -226,9 +235,11 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
                 int status = atoi(c->parser.err_status);
                 /* a response to HEAD never carries a body (RFC 9110
                  * 9.3.2), even when the request then failed to parse */
+                size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                 mast_reply_error(&c->resp.head,
                                  c->parser.err_head_method ? NULL : &c->resp.mem,
                                  status, c->parser.err_why, NULL, 0);
+                dyn_charge_resp(c, oh, om);
                 c->resp.status = status;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -260,12 +271,17 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
                     static const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
                     ssize_t w = send(c->fd, interim, sizeof interim - 1, MSG_NOSIGNAL);
                     if (w < 0) w = 0;
-                    if ((size_t)w < sizeof interim - 1)
+                    if ((size_t)w < sizeof interim - 1) {
+                        size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                         mast_buf_put(&c->resp.head, interim + w, sizeof interim - 1 - (size_t)w);
+                        dyn_charge_resp(c, oh, om);
+                    }
                     c->last_ms = now_ms();
                 } else if (oversize) {
+                    size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                     mast_reply_error(&c->resp.head, &c->resp.mem, 413,
                                      "the body is over 1 MB", NULL, 0);
+                    dyn_charge_resp(c, oh, om);
                     c->resp.status = 413;
                     c->resp.close_after = 1;
                     c->responding = 1;
@@ -275,7 +291,9 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
                     /* we close after this answer, so the head must say
                      * so: keep_alive off before building the response */
                     c->req.keep_alive = 0;
+                    size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                     mast_respond(&c->req, cfg->docroot_real, &c->resp);
+                    dyn_charge_resp(c, oh, om);
                     c->resp.close_after = 1;
                     c->responding = 1;
                     enter_write(c);
@@ -300,10 +318,12 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
             size_t grow = proj > c->req.body_cap ? proj - c->req.body_cap : 0;
             size_t old_cap = c->req.body_cap;
             if (grow && g_dyn_bytes + grow > dyn_budget(cfg)) {
+                size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                 mast_reply_error(&c->resp.head,
                                  c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
                                  503, "the server is out of buffer room, retry shortly",
                                  "Retry-After: 1\r\n", 0);
+                dyn_charge_resp(c, oh, om);
                 c->resp.status = 503;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -321,9 +341,11 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
             c->parser.len -= bconsumed;
             if (br == MAST_BODY_INCOMPLETE) return 0;
             if (br == MAST_BODY_TOO_LARGE) {
+                size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                 mast_reply_error(&c->resp.head,
                                  c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
                                  413, "the body grew past 1 MB", NULL, 0);
+                dyn_charge_resp(c, oh, om);
                 c->resp.status = 413;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -331,10 +353,12 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
                 return 1;
             }
             if (br == MAST_BODY_NOMEM) {
+                size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                 mast_reply_error(&c->resp.head,
                                  c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
                                  503, "the server is out of buffer room, retry shortly",
                                  "Retry-After: 1\r\n", 0);
+                dyn_charge_resp(c, oh, om);
                 c->resp.status = 503;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -342,9 +366,11 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
                 return 1;
             }
             if (br == MAST_BODY_BAD) {
+                size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                 mast_reply_error(&c->resp.head,
                                  c->req.method == MAST_METHOD_HEAD ? NULL : &c->resp.mem,
                                  400, "the chunked body framing is malformed", NULL, 0);
+                dyn_charge_resp(c, oh, om);
                 c->resp.status = 400;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -357,9 +383,11 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
         if (c->req.method == MAST_METHOD_POST &&
             g_dyn_bytes + c->req.body_len > dyn_budget(cfg)) {
             /* the echo would copy the body into the response buffer */
+            size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
             mast_reply_error(&c->resp.head, &c->resp.mem, 503,
                              "the server is out of buffer room, retry shortly",
                              "Retry-After: 1\r\n", 0);
+            dyn_charge_resp(c, oh, om);
             c->resp.status = 503;
             c->resp.close_after = 1;
             c->responding = 1;
@@ -368,9 +396,7 @@ static int conn_process(Conn *c, const MastConfig *cfg) {
         }
         size_t old_hcap = c->resp.head.cap, old_mcap = c->resp.mem.cap;
         mast_respond(&c->req, cfg->docroot_real, &c->resp);
-        size_t grew = (c->resp.head.cap - old_hcap) + (c->resp.mem.cap - old_mcap);
-        g_dyn_bytes += grew;
-        c->dyn_counted += grew;
+        dyn_charge_resp(c, old_hcap, old_mcap);
         c->responding = 1;
         enter_write(c);
         return 1;
@@ -399,9 +425,11 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
             /* over a cap: answer cleanly; the lingering close then drains
              * the flood so the answer is not cut off by an RST */
             int status = c->state == CONN_READ_HEAD ? 431 : 413;
+            size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
             mast_reply_error(&c->resp.head, &c->resp.mem, status,
                 status == 431 ? "the header block grew past 32 KB"
                               : "the body grew past 1 MB", NULL, 0);
+            dyn_charge_resp(c, oh, om);
             c->resp.status = status;
             c->resp.close_after = 1;
             c->responding = 1;
@@ -430,9 +458,11 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
             size_t pgrow = ptarget - c->parser.cap;
             if (pgrow && g_dyn_bytes + pgrow > dyn_budget(cfg)) {
                 if (pending) return 1;   /* let the pending answer flush first */
+                size_t oh = c->resp.head.cap, om = c->resp.mem.cap;
                 mast_reply_error(&c->resp.head, &c->resp.mem, 503,
                                  "the server is out of buffer room, retry shortly",
                                  "Retry-After: 1\r\n", 0);
+                dyn_charge_resp(c, oh, om);
                 c->resp.status = 503;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -452,9 +482,19 @@ static int conn_read_drain(Conn *c, const MastConfig *cfg) {
          * The 8 KB request-line cap is length-only, so crossing it still
          * gets its 414 by running the parser once the buffer passes it. */
         int has_lf = memchr(tmp, '\n', (size_t)r) != NULL;
+        /* past 8 KB the parser must still get its shot at a 414 - but
+         * only while the request line itself has no LF yet. A complete
+         * request line followed by a growing header line has an LF in the
+         * first 8 KB + 1 bytes, so the no-new-LF skip keeps holding and
+         * the dribble stays O(1) per byte instead of re-parsing the whole
+         * backlog per recv */
+        int line_maybe_over = c->parser.len > MAST_MAX_REQUEST_LINE &&
+            !memchr(c->parser.buf, '\n',
+                    c->parser.len < MAST_MAX_REQUEST_LINE + 1
+                        ? c->parser.len : MAST_MAX_REQUEST_LINE + 1);
         if (!pending &&
             (c->state != CONN_READ_HEAD || !c->head_waiting || has_lf ||
-             c->parser.len > MAST_MAX_REQUEST_LINE))
+             line_maybe_over))
             pending = conn_process(c, cfg);
     }
     return pending;

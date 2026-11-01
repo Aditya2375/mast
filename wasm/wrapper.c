@@ -111,7 +111,10 @@ int mast_recv(DemoConn *c, const char *data, int n) {
         size_t slice = (size_t)n - off > 16384 ? 16384 : (size_t)n - off;
         size_t cap = c->have_head ? (size_t)MAST_MAX_BODY + 8192 : MAST_MAX_HEADERS_BYTES;
         if (c->parser.len + slice > cap) {
-            mast_reply_error(&c->out, &c->out,
+            /* a response to HEAD never carries a body, even an error page;
+             * before the head parses the method is unknown, so it gets one */
+            int head413 = c->have_head && c->req.method == MAST_METHOD_HEAD;
+            mast_reply_error(&c->out, head413 ? NULL : &c->out,
                 c->have_head ? 413 : 431,
                 c->have_head ? "the body grew past 1 MB"
                              : "the header block grew past 32 KB", NULL, 0);
@@ -130,7 +133,9 @@ int mast_recv(DemoConn *c, const char *data, int n) {
                 if (r == MAST_PARSE_INCOMPLETE) break;
                 if (r == MAST_PARSE_BAD) {
                     int status = atoi(c->parser.err_status);
-                    mast_reply_error(&c->out, &c->out, status, c->parser.err_why, NULL, 0);
+                    mast_reply_error(&c->out,
+                        c->parser.err_head_method ? NULL : &c->out,
+                        status, c->parser.err_why, NULL, 0);
                     c->closed = 1;
                     return 0;
                 }
@@ -150,7 +155,9 @@ int mast_recv(DemoConn *c, const char *data, int n) {
                     if (acceptable) {
                         mast_buf_puts(&c->out, "HTTP/1.1 100 Continue\r\n\r\n");
                     } else if (oversize) {
-                        mast_reply_error(&c->out, &c->out, 413, "the body is over 1 MB", NULL, 0);
+                        mast_reply_error(&c->out,
+                            c->req.method == MAST_METHOD_HEAD ? NULL : &c->out,
+                            413, "the body is over 1 MB", NULL, 0);
                         c->closed = 1;
                         return 0;
                     } else {
@@ -176,7 +183,8 @@ int mast_recv(DemoConn *c, const char *data, int n) {
                 c->parser.len -= bc;
                 if (br == MAST_BODY_INCOMPLETE) break;
                 if (br == MAST_BODY_TOO_LARGE || br == MAST_BODY_BAD) {
-                    mast_reply_error(&c->out, &c->out,
+                    mast_reply_error(&c->out,
+                        c->req.method == MAST_METHOD_HEAD ? NULL : &c->out,
                         br == MAST_BODY_TOO_LARGE ? 413 : 400,
                         br == MAST_BODY_TOO_LARGE ? "the body grew past 1 MB"
                                                   : "the chunked body framing is malformed",

@@ -53,6 +53,7 @@ typedef struct {
     long long content_length;     /* -1 when absent */
     int chunked;                  /* Transfer-Encoding: chunked */
     int expect_continue;          /* Expect: 100-continue */
+    const char *expect;           /* first Expect value: a differing repeat is a 400 */
     int conn_close, conn_keep_alive;   /* exact Connection tokens seen */
     int keep_alive;               /* resolved: may the connection live on */
     const char *if_none_match;
@@ -61,6 +62,7 @@ typedef struct {
     const char *if_unmodified_since;   /* If-Unmodified-Since date, or NULL */
     const char *if_range;         /* raw If-Range validator, or NULL */
     const char *range;            /* raw Range header value, or NULL */
+    int range_seen;               /* every Range line: any repeat ignores them all */
     const char *content_type;
     char authority[256];  /* absolute-form scheme://authority, or "" */
     /* body: filled by the body reader (chunked or length-delimited) */

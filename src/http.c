@@ -102,14 +102,31 @@ static int month_from_name(const char *s) {
 /* RFC 7231 IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT" (the only format
  * servers must generate; we accept exactly it back). */
 int64_t mast_parse_http_date(const char *s) {
+    /* IMF-fixdate has a fixed shape: "Sun, 06 Nov 1994 08:49:37 GMT" is
+     * exactly 29 bytes, every numeric field zero-padded and unsigned -
+     * sscanf's %d would take a sign or a single digit, so check the
+     * shape byte by byte instead */
+    if (strlen(s) != 29) return -1;
+    static const char shape[30] = "aaa, NN aaa NNNN NN:NN:NN aaa";
+    for (int i = 0; i < 29; i++) {
+        char want = shape[i];
+        unsigned char c = (unsigned char)s[i];
+        if (want == 'N' && !isdigit(c)) return -1;
+        if (want == 'a' && !isalpha(c)) return -1;
+        if ((want == ' ' || want == ',' || want == ':') && c != want) return -1;
+    }
+    char wday[4], mon[4], gmt[4];
+    memcpy(wday, s, 3); wday[3] = '\0';
+    memcpy(mon, s + 8, 3); mon[3] = '\0';
+    memcpy(gmt, s + 26, 3); gmt[3] = '\0';
+    int mday = (s[5] - '0') * 10 + (s[6] - '0');
+    int year = (s[12] - '0') * 1000 + (s[13] - '0') * 100 +
+               (s[14] - '0') * 10 + (s[15] - '0');
+    int hour = (s[17] - '0') * 10 + (s[18] - '0');
+    int min = (s[20] - '0') * 10 + (s[21] - '0');
+    int sec = (s[23] - '0') * 10 + (s[24] - '0');
     struct tm tmv;
     memset(&tmv, 0, sizeof tmv);
-    int mday, year, hour, min, sec;
-    char wday[4], mon[4], gmt[4];
-    if (sscanf(s, "%3c, %2d %3c %4d %2d:%2d:%2d %3c",
-               wday, &mday, mon, &year, &hour, &min, &sec, gmt) != 8)
-        return -1;
-    wday[3] = mon[3] = gmt[3] = '\0';   /* %Nc does not terminate */
     int month = month_from_name(mon);
     if (month < 0 || strcmp(gmt, "GMT") != 0) return -1;
     /* the weekday must be a real day name ("ZZZ" is not a date), though
@@ -219,8 +236,16 @@ void mast_parser_free(MastParser *p) {
 static MastParse bad(MastParser *p, const char *status, const char *why) {
     memcpy(p->err_status, status, 4);
     snprintf(p->err_why, sizeof p->err_why, "%s", why);
-    /* a response to HEAD never carries a body, even an error page */
-    p->err_head_method = p->len >= 5 && memcmp(p->buf, "HEAD ", 5) == 0;
+    /* a response to HEAD never carries a body, even an error page. Skip
+     * any not-yet-consumed leading blank lines first: bad() can fire from
+     * the length-cap paths before the blank-line skip has run. An empty
+     * buffer keeps the caller's preset - the head-cap path judges from
+     * the incoming data, which never landed in the buffer */
+    if (p->len > 0) {
+        size_t off = 0;
+        while (off < p->len && (p->buf[off] == '\r' || p->buf[off] == '\n')) off++;
+        p->err_head_method = p->len - off >= 5 && memcmp(p->buf + off, "HEAD ", 5) == 0;
+    }
     return MAST_PARSE_BAD;
 }
 
@@ -299,8 +324,16 @@ int mast_parser_append(MastParser *p, const char *data, size_t n, size_t cap) {
 
 MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
                            MastRequest *out, size_t *consumed) {
-    if (n && mast_parser_append(p, data, n, MAST_MAX_HEADERS_BYTES) != 0)
+    if (n && mast_parser_append(p, data, n, MAST_MAX_HEADERS_BYTES) != 0) {
+        if (p->len == 0) {
+            /* the over-cap bytes never landed in the buffer, so judge the
+             * HEAD heuristic from the incoming data itself */
+            size_t off = 0;
+            while (off < n && (data[off] == '\r' || data[off] == '\n')) off++;
+            p->err_head_method = n - off >= 5 && memcmp(data + off, "HEAD ", 5) == 0;
+        }
         return bad(p, "431", "the header block grew past 32 KB");
+    }
     if (n && !memchr(data, '\n', n)) {
         /* Without a fresh LF no line can complete, so the parse outcome is
          * unchanged and a full re-parse from byte 0 would only burn CPU:
@@ -491,6 +524,11 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
             out->chunked = 1;
         }
         else if (name_is(np, nlen, "Expect")) {
+            /* a repeat with a different value is ambiguous (RFC 9110 5.3
+             * only combines list-shaped fields) */
+            if (out->expect && strcasecmp(out->expect, vp) != 0)
+                return bad(p, "400", "two different Expect headers");
+            out->expect = vp;
             if (strcasecmp(vp, "100-continue") != 0)
                 return bad(p, "417", "only Expect: 100-continue is understood");
             out->expect_continue = 1;
@@ -541,8 +579,10 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
         else if (name_is(np, nlen, "Range")) {
             /* a repeated Range combines into a list (RFC 9110 5.3), which
              * is a multi-range - and mast's policy for multi-range is to
-             * ignore the header and serve the full body */
-            if (out->range) out->range = NULL;
+             * ignore the header and serve the full body. Count every line:
+             * a third Range must not resurrect the last value */
+            out->range_seen++;
+            if (out->range_seen > 1) out->range = NULL;
             else out->range = vp;
         }
         else if (name_is(np, nlen, "Content-Type")) out->content_type = vp;
@@ -614,14 +654,16 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
                 }
             }
             if (!got_line) break;   /* need more bytes */
-            r->line[r->line_len - 2] = '\0';
             /* a control byte (HTAB aside) has no place in a chunk
-             * extension or a trailer field (RFC 9112 7.1.1/7.1.2) */
-            for (const char *v = r->line; *v; v++) {
-                unsigned char uc = (unsigned char)*v;
+             * extension or a trailer field (RFC 9112 7.1.1/7.1.2). Scan by
+             * length, not as a C string: an embedded NUL must not hide
+             * the bytes behind it */
+            for (size_t v = 0; v < r->line_len - 2; v++) {
+                unsigned char uc = (unsigned char)r->line[v];
                 if ((uc < 32 && uc != '\t') || uc == 127)
                     return MAST_BODY_BAD;
             }
+            r->line[r->line_len - 2] = '\0';
             if (r->state == MAST_CHUNK_SIZE) {
                 /* strict: hexdigits only (no whitespace, no sign), then an
                  * optional ;extension */

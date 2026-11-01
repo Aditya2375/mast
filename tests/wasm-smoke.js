@@ -112,6 +112,20 @@ factory({}).then(m => {
            "wasm: HEAD 404 reports a Content-Length");
         ok(r.slice(headEnd + 4).startsWith("HTTP/1.1 200"),
            "wasm: HEAD 404 sends no body - the next response follows immediately");
+
+    /* round 7: an error to a HEAD stays bodyless in the demo too */
+    let hc = newConn();
+    r = send(hc, "HEAD / HTTP/1.1\r\nHost: demo\r\nBad Header Without Colon\r\n\r\n");
+    ok(statusOf(r) === 400, "wasm: malformed HEAD is 400");
+    ok(!r.split("\r\n\r\n")[1], "wasm: the 400 to a HEAD sends no body");
+    let gc = newConn();
+    r = send(gc, "GET / HTTP/1.1\r\nHost: demo\r\nBad Header Without Colon\r\n\r\n");
+    ok(statusOf(r) === 400 && !!r.split("\r\n\r\n")[1],
+       "wasm: the same 400 to a GET carries its body");
+    let hc2 = newConn();
+    r = send(hc2, "HEAD /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n");
+    ok(statusOf(r) === 400, "wasm: malformed chunk framing on HEAD is 400");
+    ok(!r.split("\r\n\r\n")[1], "wasm: the chunk 400 to a HEAD sends no body");
     }
 
     c = newConn();

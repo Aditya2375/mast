@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2349 lines of C.
+2433 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -50,9 +50,10 @@ are not charged against it.
   the full 200 body. The two list headers combine when repeated
   (`If-Match: "a"` plus `If-Match: "b"` is one list, per RFC 9110 5.3);
   a repeated `If-Modified-Since`, `If-Unmodified-Since` or `If-Range`
-  is ambiguous, so it is a 400. Dates parse strictly: a made-up weekday
-  name or a year before 1970 means the header is ignored, never
-  rejected and never honored. `POST /echo` stores nothing, so any
+  is ambiguous, so it is a 400. Dates parse strictly, as the fixed
+  29-byte IMF-fixdate shape with zero-padded unsigned fields: a made-up
+  weekday name, a sign, a lone digit or a year before 1970 means the
+  header is ignored, never rejected and never honored. `POST /echo` stores nothing, so any
   `If-Match` there is a 412.
 - **Range requests.** A single byte range per request - `bytes=0-99`,
   `bytes=500-` or the last N bytes with `bytes=-64` - answered 206 with a
@@ -65,7 +66,8 @@ are not charged against it.
   transfer-coding (chunk extensions and trailers included, though a
   control byte in either - HTAB aside - is a 400).
   `Expect: 100-continue` gets an interim 100 only when the body will be
-  accepted, the final error otherwise; any other Expect is a 417.
+  accepted, the final error otherwise; any other Expect is a 417, and a
+  repeated Expect with a different value is a 400.
 - **Keep-alive and pipelining.** HTTP/1.1 connections stay open across
   requests; several requests written in one flight are answered in order,
   with a per-turn budget (8 responses or 512 KB) so one fast pipelining
@@ -164,13 +166,15 @@ the request:
 - Single process, single thread. One core serves everything.
 - No virtual hosts, no content negotiation, no compression, no CGI.
 - One range per request; multipart/byteranges is not implemented (a
-  multi-range header - including two Range headers, which combine into
-  one list per RFC 9110 5.3 - is ignored and the full body served).
+  multi-range header - including a repeated Range header, which
+  combines into one list per RFC 9110 5.3 no matter how many lines - is
+  ignored and the full body served).
 - An HTTP/1.1 request with an empty Host header is a 400 (the
   conservative reading of RFC 9112 3.2).
 - The -M budget bounds the dynamic buffers held at once: each
   connection's parse backlog (pipelined bytes waiting their turn),
-  request body and response pages. A connection that would push past it
+  request body and response pages - error pages and the 100-continue
+  interim included. A connection that would push past it
   gets a 503 with Retry-After: 1 and closes. The fixed Conn struct
   (about 40 KB per connection, so `-c 1024` carries roughly 40 MB
   whether the budget is reached or not) and the static file buffers are
@@ -185,11 +189,13 @@ the request:
 
 `make test` runs three layers:
 
-- a **326 checks** unit suite over the parser (including byte-by-byte
+- a **341 checks** unit suite over the parser (including byte-by-byte
   fragmented feeds and a CPU bound on a 26 KB head dribbled in one byte
-  at a time), path sanitizer, ranges, dates, chunked bodies and the
-  full response pipeline against a temporary document root;
-- a **159 checks** live-socket suite that runs the real server and talks
+  at a time through the library feed API - the socket server's side of
+  the same guarantee is tested live, below), path sanitizer, ranges,
+  dates, chunked bodies and the full response pipeline against a
+  temporary document root;
+- a **176 checks** live-socket suite that runs the real server and talks
   to it over TCP: keep-alive, pipelining, chunked POSTs, exact wire framing
   after 405/416/HEAD-404, single-flight 1 MB bodies, a clean readable 413,
   100-continue (and its absence on HTTP/1.0), OPTIONS on * and on paths,
@@ -210,11 +216,15 @@ the request:
   404s, blank-line floods, the memory budget refusing with 503 (plain
   bodies, a chunked batch whose buffer doubling projects past it, and an
   exact ledger across keep-alive reuse), a dribbled no-LF head never
-  blocking other clients, an 800-byte directory redirect with a
+  blocking other clients - including a 28 KB header line dribbled in one
+  byte at a time past the 8 KB request-line cap, the server's /proc CPU
+  for the whole dribble bounded at 150 ms - an 800-byte directory redirect with a
   Content-Length that matches the delivered body byte for byte, invalid
-  suffix ranges ignored with a 200, junk dates ignored, control bytes in
+  suffix ranges ignored with a 200, one Range honored but two through
+  five ignored, junk dates ignored, control bytes (NUL included) in
   chunk extensions and trailers refused, conditional repeats combined or
-  refused, EMFILE
+  refused, a differing repeated Expect refused, error responses charged
+  to the memory budget and handed back, EMFILE
   recovery, a root-document-tree server and 50 concurrent clients;
 - `tests/fuzz-sockets.py`, a stateful socket fuzzer: random mutated
   sessions with fragmentation, pipelining, half-closes, RSTs, oversized

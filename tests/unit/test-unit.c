@@ -50,6 +50,43 @@ int main(void) {
           "repeated If-Unmodified-Since is a 400");
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nIf-Range: \"a\"\r\nIf-Range: \"b\"\r\n\r\n", &q, &used) == MAST_PARSE_BAD,
           "repeated If-Range is a 400");
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1\r\nRange: bytes=2-3\r\nRange: bytes=4-5\r\n\r\n", &q, &used) == MAST_PARSE_OK
+          && q.range == NULL && q.range_seen == 3, "three Range lines stay ignored");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\nhi", &q, &used) == MAST_PARSE_OK
+          && q.expect_continue, "identical repeated Expect merges");
+    CHECK(parse("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nExpect: 100-continue\r\nExpect: max\r\n\r\nhi", &q, &used) == MAST_PARSE_BAD,
+          "a differing repeated Expect is a 400");
+    {
+        /* a HEAD that fails must not get an error body, even when
+         * leading blank lines have not been consumed yet (the head cap
+         * can fire before the blank-line skip runs) */
+        static char big[40000];
+        int bn = snprintf(big, sizeof big, "\r\n\r\nHEAD /");
+        memset(big + bn, 'y', 39000);
+        bn += 39000;
+        MastParser p;
+        size_t u2 = 0;
+        mast_parser_init(&p);
+        MastParse pr = mast_parser_feed(&p, big, (size_t)bn, &q, &u2);
+        CHECK(pr == MAST_PARSE_BAD && strcmp(p.err_status, "431") == 0,
+              "a 39 KB no-LF block is a 431");
+        CHECK(p.err_head_method == 1,
+              "the 431 to a HEAD stays bodyless even with blanks pending");
+        mast_parser_free(&p);
+    }
+    {
+        MastParser p;
+        size_t u2 = 0;
+        mast_parser_init(&p);
+        MastParse pr = mast_parser_feed(&p, "\r\n\r\nHEAD /", 10, &q, &u2);
+        CHECK(pr == MAST_PARSE_INCOMPLETE, "blanks plus a partial line wait");
+        static char fill[9000];
+        memset(fill, 'y', sizeof fill);
+        pr = mast_parser_feed(&p, fill, sizeof fill, &q, &u2);
+        CHECK(pr == MAST_PARSE_BAD && strcmp(p.err_status, "414") == 0 &&
+              p.err_head_method == 1, "the 414 to a HEAD stays bodyless");
+        mast_parser_free(&p);
+    }
     CHECK(parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &q, &used) == MAST_PARSE_OK
           && q.keep_alive, "1.0 keep-alive opt-in");
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &q, &used) == MAST_PARSE_OK
@@ -336,6 +373,20 @@ int main(void) {
           "a fake weekday name is refused");
     CHECK(mast_parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT") == 784111777,
           "a mismatched real weekday still parses");
+    /* the shape is fixed: zero-padded unsigned fields, single spaces -
+     * sscanf's %d would have taken a sign or a lone digit */
+    CHECK(mast_parse_http_date("Sun, 01 Jan 2099 -5:00:00 GMT") == -1,
+          "a signed hour is not a date");
+    CHECK(mast_parse_http_date("Sun, 01 Jan 2099 +5:00:00 GMT") == -1,
+          "a +-signed hour is not a date");
+    CHECK(mast_parse_http_date("Sun, 1 Jan 2099 08:49:37 GMT") == -1,
+          "an unpadded day is not a date");
+    CHECK(mast_parse_http_date("Sun, 01 Jan 2099 8:49:37 GMT") == -1,
+          "an unpadded hour is not a date");
+    CHECK(mast_parse_http_date("Sun, 01 Jan 99 08:49:37 GMT") == -1,
+          "a two-digit year is not a date");
+    CHECK(mast_parse_http_date("Sun, 01 Jan 2099 08:49:37  GMT") == -1,
+          "a double space is not a date");
     CHECK(mast_parse_http_date("Tue, 31 Feb 2026 08:49:37 GMT") == -1,
           "February 31st is not a date");
     CHECK(mast_parse_http_date("Fri, 29 Feb 2036 08:49:37 GMT") != -1,
@@ -453,6 +504,31 @@ int main(void) {
         size_t cu = 0;
         CHECK(mast_body_feed(&r, &br, wire, strlen(wire), &cu) == MAST_BODY_OK
               && r.body_len == 5, "an HTAB in a chunk extension passes");
+        free(r.body);
+    }
+    {
+        /* an embedded NUL must not hide the bytes behind it */
+        MastRequest r;
+        memset(&r, 0, sizeof r);
+        r.chunked = 1;
+        MastBodyReader br;
+        memset(&br, 0, sizeof br);
+        const char wire[] = "5\x00\x01\x02\r\nhello\r\n0\r\n\r\n";
+        size_t cu = 0;
+        CHECK(mast_body_feed(&r, &br, wire, sizeof wire - 1, &cu) == MAST_BODY_BAD,
+              "a NUL in a chunk size line is a 400");
+        free(r.body);
+    }
+    {
+        MastRequest r;
+        memset(&r, 0, sizeof r);
+        r.chunked = 1;
+        MastBodyReader br;
+        memset(&br, 0, sizeof br);
+        const char wire[] = "5\r\nhello\r\n0\r\nX-T: a\x00b\r\n\r\n";
+        size_t cu = 0;
+        CHECK(mast_body_feed(&r, &br, wire, sizeof wire - 1, &cu) == MAST_BODY_BAD,
+              "a NUL in a trailer is a 400");
         free(r.body);
     }
     {
