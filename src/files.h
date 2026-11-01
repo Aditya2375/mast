@@ -12,7 +12,7 @@ typedef struct {
     char docroot[4096];       /* realpath of the served root */
     int fd;                   /* an open fd for the file, or -1 */
     struct stat st;           /* valid when fd >= 0 */
-    char etag[64];            /* "mtime-size" hex */
+    char etag[96];            /* strong: "ino-size-mtimesec-mtimens" hex */
     char last_modified[MAST_DATE_LEN];   /* HTTP-date */
     const char *mime;
     int is_dir;               /* path is a directory: redirect to /index */
@@ -25,8 +25,10 @@ typedef struct {
 int mast_file_open(const char *docroot, const MastRequest *req, MastFile *out);
 
 /* Single-range parsing: "bytes=A-B", "bytes=A-", "bytes=-B". Returns 1 and
- * fills the start/len out-params (clamped to size), or 0 for none.
- * Returns -1 for unsatisfiable (416). */
+ * fills the start/len out-params (clamped to size). Returns 0 when the
+ * Range header should be ignored and the full body served (absent, unknown
+ * unit, malformed, or multi-range - RFC 9110 permits ignoring Range).
+ * Returns -1 for a syntactically valid but unsatisfiable range (416). */
 int mast_range_parse(const char *header, long long size,
                      long long *start, long long *len);
 

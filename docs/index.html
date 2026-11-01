@@ -51,7 +51,7 @@
   the parser is the real one, caps and all. Requests stay on one keep-alive
   connection until a response says close.</p>
 </main>
-<script src="mast.js?v=87a72181d8f0"></script>
+<script src="mast.js?v=661a0ff94197"></script>
 <script>
 const out = document.getElementById('out');
 const req = document.getElementById('req');
@@ -71,6 +71,8 @@ const presets = {
   'GET /docs (redirect)': 'GET /docs HTTP/1.1\r\nHost: demo\r\n\r\n',
   'POST /echo': 'POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\nhello, mast!',
   'POST /echo (chunked)': 'POST /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7\r\n, mast!\r\n0\r\n\r\n',
+  'POST /echo (Expect: 100-continue)': 'POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello',
+  'OPTIONS *': 'OPTIONS * HTTP/1.1\r\nHost: demo\r\n\r\n',
   'pipelined x2': 'GET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\nGET /data.json HTTP/1.1\r\nHost: demo\r\n\r\n',
   'HTTP/1.0 (closes)': 'GET /hello.txt HTTP/1.0\r\n\r\n',
   'traversal attack': 'GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: demo\r\n\r\n',
@@ -141,7 +143,7 @@ function send(){
 sendBtn.addEventListener('click', send);
 newConnBtn.addEventListener('click', () => { newConn(); line('-- new connection #' + connNo + ' --\n', 'meta'); });
 
-MastModule({ locateFile: (path) => path + '?v=87a72181d8f0' }).then(m => {
+MastModule({ locateFile: (path) => path + '?v=661a0ff94197' }).then(m => {
   M = m;
   M.ccall('mast_boot', null, [], []);
   newConn();

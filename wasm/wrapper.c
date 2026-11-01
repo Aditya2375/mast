@@ -99,55 +99,101 @@ static void emit_response(DemoConn *c, MastResponse *r) {
     }
 }
 
-/* Feed bytes; parse and answer every complete request in them (pipelining
- * works, like the socket server). Returns 0, or 1 if the peer vanished. */
+/* Feed bytes in 16 KB slices; parse and answer every complete request in
+ * them (pipelining works, like the socket server, and a head followed by a
+ * big body in one call flips to the body cap the moment the head parses).
+ * Returns 0, or 1 if the peer vanished. */
 EMSCRIPTEN_KEEPALIVE
 int mast_recv(DemoConn *c, const char *data, int n) {
     if (!c || c->closed) return 1;
-    size_t cap = c->have_head ? (size_t)MAST_MAX_BODY + 8192 : MAST_MAX_HEADERS_BYTES;
-    if (mast_parser_append(&c->parser, data, (size_t)n, cap) != 0) {
-        mast_reply_error(&c->out, 431, "the header block grew past 32 KB", 0);
-        c->closed = 1;
-        return 0;
-    }
-    for (;;) {
-        if (!c->have_head) {
-            size_t consumed = 0;
-            MastParse r = mast_parser_feed(&c->parser, NULL, 0, &c->req, &consumed);
-            if (r == MAST_PARSE_INCOMPLETE) return 0;
-            if (r == MAST_PARSE_BAD) {
-                int status = atoi(c->parser.err_status);
-                mast_reply_error(&c->out, status, c->parser.err_why, 0);
-                c->closed = 1;
-                return 0;
-            }
-            c->have_head = 1;
-            memmove(c->parser.buf, c->parser.buf + consumed, c->parser.len - consumed);
-            c->parser.len -= consumed;
+    size_t off = 0;
+    while (off < (size_t)n) {
+        size_t slice = (size_t)n - off > 16384 ? 16384 : (size_t)n - off;
+        size_t cap = c->have_head ? (size_t)MAST_MAX_BODY + 8192 : MAST_MAX_HEADERS_BYTES;
+        if (c->parser.len + slice > cap) {
+            mast_reply_error(&c->out, &c->out,
+                c->have_head ? 413 : 431,
+                c->have_head ? "the body grew past 1 MB"
+                             : "the header block grew past 32 KB", NULL, 0);
+            c->closed = 1;
+            return 0;
         }
-        if (c->req.chunked || c->req.content_length > 0) {
-            size_t bc = 0;
-            MastBodyRead br = mast_body_feed(&c->req, &c->body, c->parser.buf, c->parser.len, &bc);
-            memmove(c->parser.buf, c->parser.buf + bc, c->parser.len - bc);
-            c->parser.len -= bc;
-            if (br == MAST_BODY_INCOMPLETE) return 0;
-            if (br == MAST_BODY_BAD) {
-                mast_reply_error(&c->out, 413, "the body is missing or over 1 MB", 0);
-                c->closed = 1;
-                return 0;
-            }
+        if (mast_parser_append(&c->parser, data + off, slice, cap) != 0) {
+            c->closed = 1;
+            return 0;
         }
-        MastResponse resp;
-        mast_response_init(&resp);
-        mast_respond(&c->req, "/demo", &resp);
-        c->requests++;
-        emit_response(c, &resp);
-        int keep = !resp.close_after;
-        mast_response_free(&resp);
-        conn_reset_request(c);
-        if (!keep) { c->closed = 1; return 0; }
-        if (c->parser.len == 0) return 0;   /* no pipelined request buffered */
+        off += slice;
+        for (;;) {
+            if (!c->have_head) {
+                size_t consumed = 0;
+                MastParse r = mast_parser_feed(&c->parser, NULL, 0, &c->req, &consumed);
+                if (r == MAST_PARSE_INCOMPLETE) break;
+                if (r == MAST_PARSE_BAD) {
+                    int status = atoi(c->parser.err_status);
+                    mast_reply_error(&c->out, &c->out, status, c->parser.err_why, NULL, 0);
+                    c->closed = 1;
+                    return 0;
+                }
+                c->have_head = 1;
+                memmove(c->parser.buf, c->parser.buf + consumed, c->parser.len - consumed);
+                c->parser.len -= consumed;
+                if (c->req.expect_continue &&
+                    (c->req.chunked || c->req.content_length > 0)) {
+                    /* same policy as the socket server: interim 100 only
+                     * when the body will be accepted */
+                    int oversize = !c->req.chunked && c->req.content_length > MAST_MAX_BODY;
+                    int acceptable = c->req.path_ok
+                        && c->req.method != MAST_METHOD_OTHER
+                        && (c->req.method != MAST_METHOD_POST || strcmp(c->req.path, "/echo") == 0)
+                        && !oversize;
+                    if (acceptable) {
+                        mast_buf_puts(&c->out, "HTTP/1.1 100 Continue\r\n\r\n");
+                    } else if (oversize) {
+                        mast_reply_error(&c->out, &c->out, 413, "the body is over 1 MB", NULL, 0);
+                        c->closed = 1;
+                        return 0;
+                    } else {
+                        MastResponse resp;
+                        mast_response_init(&resp);
+                        mast_respond(&c->req, "/demo", &resp);
+                        c->requests++;
+                        emit_response(c, &resp);
+                        mast_response_free(&resp);
+                        conn_reset_request(c);
+                        c->closed = 1;
+                        return 0;
+                    }
+                }
+            }
+            if (c->req.chunked || c->req.content_length > 0) {
+                size_t bc = 0;
+                MastBodyRead br = mast_body_feed(&c->req, &c->body, c->parser.buf, c->parser.len, &bc);
+                memmove(c->parser.buf, c->parser.buf + bc, c->parser.len - bc);
+                c->parser.len -= bc;
+                if (br == MAST_BODY_INCOMPLETE) break;
+                if (br == MAST_BODY_TOO_LARGE || br == MAST_BODY_BAD) {
+                    mast_reply_error(&c->out, &c->out,
+                        br == MAST_BODY_TOO_LARGE ? 413 : 400,
+                        br == MAST_BODY_TOO_LARGE ? "the body grew past 1 MB"
+                                                  : "the chunked body framing is malformed",
+                        NULL, 0);
+                    c->closed = 1;
+                    return 0;
+                }
+            }
+            MastResponse resp;
+            mast_response_init(&resp);
+            mast_respond(&c->req, "/demo", &resp);
+            c->requests++;
+            emit_response(c, &resp);
+            int keep = !resp.close_after;
+            mast_response_free(&resp);
+            conn_reset_request(c);
+            if (!keep) { c->closed = 1; return 0; }
+            if (c->parser.len == 0) break;   /* no pipelined request buffered */
+        }
     }
+    return 0;
 }
 
 EMSCRIPTEN_KEEPALIVE

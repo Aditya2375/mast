@@ -15,15 +15,20 @@ static void usage(FILE *f) {
         "usage: mast [-d docroot] [-p port] [-c max-connections]\n"
         "  -d docroot          directory to serve (default: .)\n"
         "  -p port             port to listen on (default: 8080)\n"
-        "  -c max-connections  simultaneous connection cap (default: 1024)\n");
+        "  -c max-connections  simultaneous connection cap (default: 1024)\n"
+        "  -H header-ms        time to finish a request head (default: 10000)\n"
+        "  -I idle-ms          keep-alive idle between requests (default: 15000)\n"
+        "  -B body-ms          time to finish a request body (default: 30000)\n"
+        "  -W write-ms         stalled response write (default: 30000)\n");
 }
 
 int main(int argc, char **argv) {
     const char *docroot = ".";
     int port = 8080;
     int max_conn = 1024;
+    int header_ms = 10000, idle_ms = 15000, body_ms = 30000, write_ms = 30000;
     int opt;
-    while ((opt = getopt(argc, argv, "d:p:c:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:p:c:H:I:B:W:h")) != -1) {
         char *endp = NULL;
         switch (opt) {
         case 'd': docroot = optarg; break;
@@ -41,6 +46,18 @@ int main(int argc, char **argv) {
                 return 2;
             }
             break;
+        case 'H': case 'I': case 'B': case 'W': {
+            long v = strtol(optarg, &endp, 10);
+            if (!endp || *endp || v < 100 || v > 3600000) {
+                fprintf(stderr, "mast: timeouts are 100-3600000 ms\n");
+                return 2;
+            }
+            if (opt == 'H') header_ms = (int)v;
+            else if (opt == 'I') idle_ms = (int)v;
+            else if (opt == 'B') body_ms = (int)v;
+            else write_ms = (int)v;
+            break;
+        }
         case 'h': usage(stdout); return 0;
         default: usage(stderr); return 2;
         }
@@ -59,10 +76,10 @@ int main(int argc, char **argv) {
         .docroot_real = real,
         .port = port,
         .max_conn = max_conn,
-        .header_timeout_ms = 10000,
-        .idle_timeout_ms = 15000,
-        .write_timeout_ms = 30000,
-        .body_timeout_ms = 30000,
+        .header_timeout_ms = header_ms,
+        .idle_timeout_ms = idle_ms,
+        .write_timeout_ms = write_ms,
+        .body_timeout_ms = body_ms,
     };
     return mast_serve(&cfg);
 }

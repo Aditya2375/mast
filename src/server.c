@@ -1,8 +1,11 @@
 /* server.c - one thread, one epoll loop, every socket non-blocking. A
  * connection is a small state machine: read the head, read the body,
  * write the response (headers, then the file range via sendfile), then
- * keep-alive or close. Slow clients are cut off by per-state timeouts, so
- * a trickling slowloris never pins a slot for longer than the limit. */
+ * keep-alive or close. Slow clients are cut off by per-state timeouts
+ * measured from real progress, so a trickling slowloris or a client that
+ * stops reading never pins a slot. A closing connection lingers a moment
+ * to drain the peer's unread bytes, so the final response is never cut
+ * off by an RST. */
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "server.h"
@@ -26,6 +29,8 @@ typedef enum {
     CONN_READ_HEAD, CONN_READ_BODY, CONN_WRITE, CONN_DRAIN_CLOSE
 } ConnState;
 
+#define DRAIN_TIMEOUT_MS 5000
+
 typedef struct {
     int fd;
     ConnState state;
@@ -33,13 +38,14 @@ typedef struct {
     MastRequest req;
     MastBodyReader body;
     int have_head;          /* the request line + headers are parsed */
-    size_t head_consumed;
     MastResponse resp;
     size_t out_sent;        /* bytes of resp.head/mem written */
     int responding;
     int peer_done;      /* the peer sent FIN: answer, then close */
     long long file_sent;
-    long long started_ms, last_ms;
+    int requests;       /* completed requests on this connection */
+    long long started_ms, last_ms;   /* last_ms: last real progress */
+    long long drain_deadline;
     struct sockaddr_in peer;
 } Conn;
 
@@ -65,13 +71,24 @@ static void conn_free(Conn *c) {
     c->fd = -1;
 }
 
-static void log_access(Conn *c, const char *docroot) {
-    (void)docroot;
+/* Request bytes are attacker-controlled: escape anything a terminal or a
+ * log pipeline could trip on before it reaches stdout. */
+static void log_escaped(const char *s) {
+    for (const unsigned char *q = (const unsigned char *)s; *q; q++) {
+        if (*q < 32 || *q == 127 || *q > 126) fprintf(stdout, "\\x%02x", *q);
+        else fputc(*q, stdout);
+    }
+}
+
+static void log_access(Conn *c) {
     char ip[32] = "?";
     inet_ntop(AF_INET, &c->peer.sin_addr, ip, sizeof ip);
     long long bytes = (long long)c->resp.head.len + c->resp.mem.len + c->file_sent;
-    fprintf(stdout, "%s %s %s -> %d (%lld bytes, %lld ms)\n",
-            ip, c->req.method_raw, c->req.target ? c->req.target : "-",
+    fprintf(stdout, "%s ", ip);
+    log_escaped(c->req.method_raw);
+    fputc(' ', stdout);
+    if (c->req.target) log_escaped(c->req.target); else fputc('-', stdout);
+    fprintf(stdout, " -> %d (%lld bytes, %lld ms)\n",
             c->resp.status, bytes, now_ms() - c->started_ms);
     fflush(stdout);
 }
@@ -89,12 +106,14 @@ static void conn_next_request(Conn *c) {
     c->out_sent = 0;
     c->file_sent = 0;
     c->state = CONN_READ_HEAD;
-    c->started_ms = now_ms();
 }
 
 /* Write as much of the pending response as the socket takes. Returns 1
  * when the response is fully sent, 0 when more writes are needed, -1 when
- * the connection is dead. */
+ * the connection is dead. Every loop iteration must make progress or
+ * return: sendfile reporting 0 means the file shrank under us, the
+ * promised Content-Length can never arrive, and the only honest answer is
+ * to close. */
 static int conn_flush(Conn *c) {
     while (c->out_sent < c->resp.head.len + c->resp.mem.len) {
         const char *p;
@@ -108,25 +127,30 @@ static int conn_flush(Conn *c) {
         }
         ssize_t w = send(c->fd, p, n, MSG_NOSIGNAL);
         if (w < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
             return -1;
         }
+        if (w == 0) return 0;
         c->out_sent += (size_t)w;
+        c->last_ms = now_ms();
     }
     while (c->resp.has_file && c->file_sent < c->resp.file_len) {
         off_t off = (off_t)(c->resp.file_off + c->file_sent);
         size_t want = (size_t)(c->resp.file_len - c->file_sent);
         ssize_t w = sendfile(c->fd, c->resp.file.fd, &off, want);
         if (w < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return 0;
             return -1;
         }
+        if (w == 0) return -1;   /* truncated mid-transfer: cannot complete */
         c->file_sent += w;
+        c->last_ms = now_ms();
     }
     return 1;
 }
 
-/* Feed buffered bytes through the parser; may produce a response. */
+/* Feed buffered bytes through the parser; may produce a response. Returns
+ * 1 when a response is pending, 0 when more bytes are needed. */
 static int conn_process(Conn *c, const char *docroot) {
     for (;;) {
         if (!c->have_head) {
@@ -135,7 +159,8 @@ static int conn_process(Conn *c, const char *docroot) {
             if (r == MAST_PARSE_INCOMPLETE) return 0;   /* wait for bytes */
             if (r == MAST_PARSE_BAD) {
                 int status = atoi(c->parser.err_status);
-                mast_reply_error(&c->resp.head, status, c->parser.err_why, 0);
+                mast_reply_error(&c->resp.head, &c->resp.mem, status,
+                                 c->parser.err_why, NULL, 0);
                 c->resp.status = status;
                 c->resp.close_after = 1;
                 c->responding = 1;
@@ -144,13 +169,44 @@ static int conn_process(Conn *c, const char *docroot) {
             }
             /* a parsed head: drop the consumed bytes from the buffer */
             c->have_head = 1;
-            c->head_consumed = consumed;
             memmove(c->parser.buf, c->parser.buf + consumed, c->parser.len - consumed);
             c->parser.len -= consumed;
             c->state = CONN_READ_BODY;
             if (c->req.expect_continue && (c->req.chunked || c->req.content_length > 0)) {
-                /* answer Expect: 100-continue by just proceeding - the body
-                 * follows on the wire whether or not we interim-reply */
+                /* RFC 9110 10.1.1: the interim 100 only when the body will
+                 * be accepted; otherwise the final error right away, and
+                 * the unread body must not poison a follow-up request. */
+                int oversize = !c->req.chunked && c->req.content_length > MAST_MAX_BODY;
+                int acceptable = c->req.path_ok
+                    && c->req.method != MAST_METHOD_OTHER
+                    && (c->req.method != MAST_METHOD_POST || strcmp(c->req.path, "/echo") == 0)
+                    && !oversize;
+                if (acceptable) {
+                    /* send the interim right away: the client waits for it
+                     * before it will ever send the body. Anything the
+                     * socket cannot take stays buffered ahead of the final
+                     * response head, which is the correct wire order. */
+                    static const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                    ssize_t w = send(c->fd, interim, sizeof interim - 1, MSG_NOSIGNAL);
+                    if (w < 0) w = 0;
+                    if ((size_t)w < sizeof interim - 1)
+                        mast_buf_put(&c->resp.head, interim + w, sizeof interim - 1 - (size_t)w);
+                    c->last_ms = now_ms();
+                } else if (oversize) {
+                    mast_reply_error(&c->resp.head, &c->resp.mem, 413,
+                                     "the body is over 1 MB", NULL, 0);
+                    c->resp.status = 413;
+                    c->resp.close_after = 1;
+                    c->responding = 1;
+                    c->state = CONN_WRITE;
+                    return 1;
+                } else {
+                    mast_respond(&c->req, docroot, &c->resp);
+                    c->resp.close_after = 1;
+                    c->responding = 1;
+                    c->state = CONN_WRITE;
+                    return 1;
+                }
             }
         }
         /* body */
@@ -161,9 +217,19 @@ static int conn_process(Conn *c, const char *docroot) {
             memmove(c->parser.buf, c->parser.buf + bconsumed, c->parser.len - bconsumed);
             c->parser.len -= bconsumed;
             if (br == MAST_BODY_INCOMPLETE) return 0;
-            if (br == MAST_BODY_BAD) {
-                mast_reply_error(&c->resp.head, 413, "the body is missing or over 1 MB", 0);
+            if (br == MAST_BODY_TOO_LARGE) {
+                mast_reply_error(&c->resp.head, &c->resp.mem, 413,
+                                 "the body grew past 1 MB", NULL, 0);
                 c->resp.status = 413;
+                c->resp.close_after = 1;
+                c->responding = 1;
+                c->state = CONN_WRITE;
+                return 1;
+            }
+            if (br == MAST_BODY_BAD) {
+                mast_reply_error(&c->resp.head, &c->resp.mem, 400,
+                                 "the chunked body framing is malformed", NULL, 0);
+                c->resp.status = 400;
                 c->resp.close_after = 1;
                 c->responding = 1;
                 c->state = CONN_WRITE;
@@ -176,6 +242,60 @@ static int conn_process(Conn *c, const char *docroot) {
         c->state = CONN_WRITE;
         return 1;
     }
+}
+
+/* Drain available bytes into the parse buffer, parsing as they land so a
+ * head followed by a big body in one flight flips to the body cap in time.
+ * The drain always reads to EAGAIN: a FIN arriving with the last request
+ * byte must be consumed now, because edge-triggered epoll will not report
+ * it twice. Once a response is pending, further pipelined bytes stay
+ * buffered (and capped) until the flush completes. Returns 1 when a
+ * response is pending, 0 when drained, -1 when dead. */
+static int conn_read_drain(Conn *c, const char *docroot) {
+    char tmp[16384];
+    int pending = 0;
+    for (;;) {
+        ssize_t r = recv(c->fd, tmp, sizeof tmp, 0);
+        if (r <= 0) {
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if (r < 0 && errno == EINTR) continue;
+            if (r == 0) c->peer_done = 1;   /* FIN: the request may still be whole */
+            else return -1;   /* a hard error mid-request */
+            break;
+        }
+        c->last_ms = now_ms();
+        size_t cap = c->state == CONN_READ_HEAD
+            ? MAST_MAX_HEADERS_BYTES
+            : (size_t)MAST_MAX_BODY + 8192;
+        if (c->parser.len + (size_t)r > cap) {
+            if (pending) return -1;   /* flooding past a pending response */
+            /* over a cap: answer cleanly; the lingering close then drains
+             * the flood so the answer is not cut off by an RST */
+            int status = c->state == CONN_READ_HEAD ? 431 : 413;
+            mast_reply_error(&c->resp.head, &c->resp.mem, status,
+                status == 431 ? "the header block grew past 32 KB"
+                              : "the body grew past 1 MB", NULL, 0);
+            c->resp.status = status;
+            c->resp.close_after = 1;
+            c->responding = 1;
+            c->state = CONN_WRITE;
+            return 1;
+        }
+        if (mast_parser_append(&c->parser, tmp, (size_t)r, cap) != 0) return -1;
+        if (!pending) pending = conn_process(c, docroot);
+    }
+    return pending;
+}
+
+/* The response is out and the connection ends: half-close our side so the
+ * peer sees a clean FIN after the full response, then drain whatever it
+ * still sends until its own FIN or a short deadline. This keeps unread
+ * request bytes from turning our close into an RST that destroys the
+ * response before the peer can read it. */
+static void conn_linger_close(Conn *c) {
+    shutdown(c->fd, SHUT_WR);
+    c->state = CONN_DRAIN_CLOSE;
+    c->drain_deadline = now_ms() + DRAIN_TIMEOUT_MS;
 }
 
 int mast_serve(const MastConfig *cfg) {
@@ -222,7 +342,6 @@ int mast_serve(const MastConfig *cfg) {
             perror("epoll_wait");
             break;
         }
-        long long now = now_ms();
         for (int i = 0; i < nev; i++) {
             int fd = evs[i].data.fd;
             if (fd == lfd) {
@@ -241,7 +360,7 @@ int mast_serve(const MastConfig *cfg) {
                     c->peer = peer;
                     mast_parser_init(&c->parser);
                     mast_response_init(&c->resp);
-                    c->started_ms = c->last_ms = now;
+                    c->started_ms = c->last_ms = now_ms();
                     struct epoll_event cev;
                     memset(&cev, 0, sizeof cev);
                     cev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
@@ -258,39 +377,21 @@ int mast_serve(const MastConfig *cfg) {
                 continue;
             }
             Conn *c = evs[i].data.ptr;
-            c->last_ms = now;
             if ((evs[i].events & EPOLLERR) && c->state != CONN_WRITE) goto close_conn;
+            if (c->state == CONN_DRAIN_CLOSE) {
+                /* lingering close: discard whatever the peer still sends */
+                char junk[8192];
+                ssize_t r;
+                while ((r = recv(c->fd, junk, sizeof junk, 0)) > 0) {}
+                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+                    goto close_conn;
+                if (now_ms() >= c->drain_deadline) goto close_conn;
+                continue;
+            }
             if ((evs[i].events & (EPOLLIN | EPOLLRDHUP)) &&
                 (c->state == CONN_READ_HEAD || c->state == CONN_READ_BODY)) {
-                /* buffer the fresh bytes, then let conn_process drive the
-                 * parser over the buffer - one parse path, no double work */
-                char tmp[16384];
-                for (;;) {
-                    ssize_t r = recv(c->fd, tmp, sizeof tmp, 0);
-                    if (r <= 0) {
-                        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-                        if (r < 0 && errno == EINTR) continue;
-                        if (r == 0) { c->peer_done = 1; break; }   /* FIN: the request may still be whole */
-                        goto close_conn;   /* a hard error mid-request */
-                    }
-                    size_t cap = c->state == CONN_READ_HEAD
-                        ? MAST_MAX_HEADERS_BYTES
-                        : (size_t)MAST_MAX_BODY + 8192;
-                    if (c->parser.len + (size_t)r > cap) {
-                        /* an over-cap head gets a real 431; an over-cap body
-                         * is a flood - close without ceremony */
-                        if (c->state == CONN_READ_BODY) goto close_conn;
-                        mast_reply_error(&c->resp.head, 431,
-                            "the header block grew past 32 KB", 0);
-                        c->resp.status = 431;
-                        c->resp.close_after = 1;
-                        c->responding = 1;
-                        c->state = CONN_WRITE;
-                        goto write_side;
-                    }
-                    if (mast_parser_append(&c->parser, tmp, (size_t)r, cap) != 0) goto close_conn;
-                }
-                int has = conn_process(c, cfg->docroot_real);
+                int has = conn_read_drain(c, cfg->docroot_real);
+                if (has < 0) goto close_conn;
                 if (has) goto write_side;
                 if (c->peer_done) goto close_conn;   /* an incomplete request from a gone peer */
             }
@@ -300,10 +401,12 @@ int mast_serve(const MastConfig *cfg) {
                 int done = conn_flush(c);
                 if (done < 0) goto close_conn;
                 if (done) {
-                    log_access(c, cfg->docroot_real);
+                    log_access(c);
+                    c->requests++;
                     /* FIN only ends the connection once no pipelined
                      * request is still buffered */
-                    if (c->resp.close_after || (c->peer_done && c->parser.len == 0)) goto close_conn;
+                    if (c->resp.close_after) { conn_linger_close(c); continue; }
+                    if (c->peer_done && c->parser.len == 0) goto close_conn;
                     conn_next_request(c);
                     /* pipelined bytes may already sit in the buffer */
                     if (c->parser.len > 0) {
@@ -321,18 +424,28 @@ int mast_serve(const MastConfig *cfg) {
             free(c);
             nconn--;
         }
-        /* timeout sweep */
+        /* timeout sweep: every limit counts from real progress, so junk
+         * events on the socket can never keep a dead connection alive */
         long long t = now_ms();
         for (int k = 0; k < cfg->max_conn; k++) {
             Conn *c = conns[k];
             if (!c) continue;
+            if (c->state == CONN_DRAIN_CLOSE) {
+                if (t >= c->drain_deadline) {
+                    epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
+                    conn_free(c);
+                    free(c);
+                    conns[k] = NULL;
+                    nconn--;
+                }
+                continue;
+            }
             long long limit;
             if (c->state == CONN_READ_HEAD)
-                limit = c->have_head ? cfg->idle_timeout_ms : cfg->header_timeout_ms;
+                limit = c->requests > 0 ? cfg->idle_timeout_ms : cfg->header_timeout_ms;
             else if (c->state == CONN_READ_BODY) limit = cfg->body_timeout_ms;
             else limit = cfg->write_timeout_ms;
-            long long base = c->state == CONN_READ_HEAD && !c->have_head ? c->started_ms : c->last_ms;
-            if (t - base > limit) {
+            if (t - c->last_ms > limit) {
                 epoll_ctl(ep, EPOLL_CTL_DEL, c->fd, NULL);
                 conn_free(c);
                 free(c);

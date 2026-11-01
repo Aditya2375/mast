@@ -236,6 +236,35 @@ static int name_is(const char *a, size_t an, const char *b) {
     return strlen(b) == an && strncasecmp(a, b, an) == 0;
 }
 
+/* A comma-separated list header carries exact, case-insensitive tokens:
+ * substring matching would read "disclose" as "close". */
+static int has_token(const char *value, const char *token) {
+    size_t tn = strlen(token);
+    for (const char *q = value; ;) {
+        while (*q == ' ' || *q == '\t' || *q == ',') q++;
+        const char *e = q;
+        while (*e && *e != ',') e++;
+        const char *te = e;
+        while (te > q && (te[-1] == ' ' || te[-1] == '\t')) te--;
+        if ((size_t)(te - q) == tn && strncasecmp(q, token, tn) == 0) return 1;
+        if (!*e) return 0;
+        q = e + 1;
+    }
+}
+
+/* Non-negative decimal integer, strict: digits only, no sign, no space. */
+static int parse_decimal(const char *s, long long *out) {
+    if (!isdigit((unsigned char)s[0])) return -1;
+    long long v = 0;
+    for (const char *q = s; *q; q++) {
+        if (!isdigit((unsigned char)*q)) return -1;
+        if (v > (9223372036854775807LL - 9) / 10) return -1;   /* overflow */
+        v = v * 10 + (*q - '0');
+    }
+    *out = v;
+    return 0;
+}
+
 int mast_parser_append(MastParser *p, const char *data, size_t n, size_t cap) {
     if (p->len + n > cap) return -1;
     if (p->len + n > p->cap) {
@@ -290,9 +319,35 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
     size_t tlen = (size_t)(sp2 - sp1 - 1);
     if (tlen == 0) return bad(p, "400", "the request target is empty");
     if (tlen >= MAST_MAX_TARGET) return bad(p, "414", "the request target is over 2048 bytes");
+    for (size_t i = 0; i < tlen; i++) {
+        unsigned char c = (unsigned char)sp1[1 + i];
+        if (c <= 32 || c == 127)   /* raw NUL and friends truncate C strings */
+            return bad(p, "400", "the request target has an illegal byte");
+    }
     memcpy(out->target_raw, sp1 + 1, tlen);
     out->target_raw[tlen] = '\0';
     out->target = out->target_raw;
+    /* absolute-form: scheme://authority/path - keep the authority for the
+     * Host consistency check, serve the path part as origin-form */
+    {
+        const char *auth = NULL;
+        if (strncasecmp(out->target_raw, "http://", 7) == 0) auth = out->target_raw + 7;
+        else if (strncasecmp(out->target_raw, "https://", 8) == 0) auth = out->target_raw + 8;
+        if (auth) {
+            const char *slash = strchr(auth, '/');
+            size_t an = slash ? (size_t)(slash - auth) : strlen(auth);
+            if (an == 0 || an >= sizeof out->authority)
+                return bad(p, "400", "the absolute-form authority is missing or too long");
+            memcpy(out->authority, auth, an);
+            out->authority[an] = '\0';
+            if (slash) {
+                memmove(out->target_raw, slash, strlen(slash) + 1);
+            } else {
+                out->target_raw[0] = '/';
+                out->target_raw[1] = '\0';
+            }
+        }
+    }
     size_t vlen = (size_t)(eol - sp2 - 1);
     if (vlen == 8 && memcmp(sp2 + 1, "HTTP/1.1", 8) == 0) out->minor = 1;
     else if (vlen == 8 && memcmp(sp2 + 1, "HTTP/1.0", 8) == 0) out->minor = 0;
@@ -336,21 +391,32 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
         MastHeader *hd = &out->headers[out->header_count++];
         hd->name = np;
         hd->value = vp;
-        if (name_is(np, nlen, "Host")) out->host = vp;
-        else if (name_is(np, nlen, "Connection")) out->connection = vp;
+        if (name_is(np, nlen, "Host")) {
+            if (out->host) return bad(p, "400", "two Host headers");
+            out->host = vp;
+        }
+        else if (name_is(np, nlen, "Connection")) {
+            if (has_token(vp, "close")) out->conn_close = 1;
+            if (has_token(vp, "keep-alive")) out->conn_keep_alive = 1;
+            out->connection = vp;
+        }
         else if (name_is(np, nlen, "Content-Length")) {
             if (out->content_length != -1)
                 return bad(p, "400", "two Content-Length headers");
-            char *endp = NULL;
-            long long cl = strtoll(vp, &endp, 10);
-            if (endp == vp || *endp != '\0' || cl < 0)
+            long long cl = 0;
+            if (parse_decimal(vp, &cl) != 0)
                 return bad(p, "400", "Content-Length is not a non-negative integer");
             out->content_length = cl;
         }
         else if (name_is(np, nlen, "Transfer-Encoding")) {
-            if (strcasecmp(vp, "chunked") != 0)
+            if (strcasecmp(vp, "chunked") == 0) {
+                if (out->chunked)
+                    return bad(p, "400", "duplicate Transfer-Encoding: chunked");
+                out->chunked = 1;
+            } else if (has_token(vp, "chunked"))
+                return bad(p, "400", "chunked Transfer-Encoding must stand alone");
+            else
                 return bad(p, "501", "only chunked Transfer-Encoding is understood");
-            out->chunked = 1;
         }
         else if (name_is(np, nlen, "Expect")) {
             if (strcasecmp(vp, "100-continue") != 0)
@@ -359,6 +425,7 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
         }
         else if (name_is(np, nlen, "If-None-Match")) out->if_none_match = vp;
         else if (name_is(np, nlen, "If-Modified-Since")) out->if_modified_since = vp;
+        else if (name_is(np, nlen, "If-Range")) out->if_range = vp;
         else if (name_is(np, nlen, "Range")) out->range = vp;
         else if (name_is(np, nlen, "Content-Type")) out->content_type = vp;
         cur = hend + 2;
@@ -366,12 +433,14 @@ MastParse mast_parser_feed(MastParser *p, const char *data, size_t n,
 
     if (out->minor == 1 && !out->host)
         return bad(p, "400", "HTTP/1.1 requests need a Host header");
+    if (out->authority[0] && out->host && strcasecmp(out->authority, out->host) != 0)
+        return bad(p, "400", "the absolute-form authority and Host disagree");
     if (out->chunked && out->content_length != -1)
         return bad(p, "400", "Transfer-Encoding and Content-Length conflict");
     if (out->minor == 1)
-        out->keep_alive = !(out->connection && strcasestr(out->connection, "close"));
+        out->keep_alive = !out->conn_close;
     else
-        out->keep_alive = out->connection && strcasestr(out->connection, "keep-alive");
+        out->keep_alive = out->conn_keep_alive;
     out->path_ok = mast_sanitize_path(out->target, out->path, sizeof out->path);
     *consumed = (size_t)(cur - p->buf);
     return MAST_PARSE_OK;
@@ -393,7 +462,7 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
     }
     if (!req->chunked) {
         if ((unsigned long long)req->content_length > MAST_MAX_BODY)
-            return MAST_BODY_BAD;   /* the caller maps this to 413 */
+            return MAST_BODY_TOO_LARGE;   /* the caller maps this to 413 */
         size_t want = (size_t)req->content_length - req->body_len;
         size_t take = n < want ? n : want;
         memcpy(req->body + req->body_len, data, take);
@@ -422,14 +491,23 @@ MastBodyRead mast_body_feed(MastRequest *req, MastBodyReader *r,
             if (!got_line) break;   /* need more bytes */
             r->line[r->line_len - 2] = '\0';
             if (r->state == MAST_CHUNK_SIZE) {
-                char *endp = NULL;
-                unsigned long long size = strtoull(r->line, &endp, 16);
-                if (endp == r->line || (*endp != '\0' && *endp != ';'))
-                    return MAST_BODY_BAD;
+                /* strict: hexdigits only (no whitespace, no sign), then an
+                 * optional ;extension */
+                const char *q = r->line;
+                unsigned long long size = 0;
+                int digits = 0;
+                while (isxdigit((unsigned char)*q)) {
+                    if (size > ~0ULL / 16) return MAST_BODY_TOO_LARGE;
+                    size = size * 16 + (unsigned long long)hexval((unsigned char)*q);
+                    q++;
+                    digits++;
+                }
+                if (digits == 0 || (*q != '\0' && *q != ';'))
+                    return MAST_BODY_BAD;   /* malformed framing -> 400 */
                 r->line_len = 0;
                 if (size == 0) { r->state = MAST_CHUNK_TRAILER; continue; }
                 if (size > MAST_MAX_BODY || req->body_len + size > MAST_MAX_BODY)
-                    return MAST_BODY_BAD;   /* over the body cap -> 413 */
+                    return MAST_BODY_TOO_LARGE;   /* over the body cap -> 413 */
                 r->chunk_left = size;
                 r->state = MAST_CHUNK_DATA;
             } else {
@@ -483,10 +561,16 @@ void mast_reply_head(MastBuf *b, int status, const char *reason,
     mast_buf_puts(b, "\r\n");
 }
 
-void mast_reply_error(MastBuf *b, int status, const char *why, int keep_alive) {
+void mast_reply_error(MastBuf *head, MastBuf *body, int status, const char *why,
+                      const char *extra_headers, int keep_alive) {
     const char *reason = mast_reason(status);
-    char body[256];
-    int n = snprintf(body, sizeof body, "%d %s\n%s\n", status, reason, why);
-    mast_reply_head(b, status, reason, "text/plain; charset=utf-8", n, keep_alive);
-    mast_buf_put(b, body, (size_t)n);
+    char text[256];
+    int n = snprintf(text, sizeof text, "%d %s\n%s\n", status, reason, why);
+    mast_reply_head(head, status, reason, "text/plain; charset=utf-8", n, keep_alive);
+    if (extra_headers) {
+        head->len -= 2;                    /* lift the blank line ... */
+        mast_buf_puts(head, extra_headers); /* ... splice the extra headers ... */
+        mast_buf_puts(head, "\r\n");      /* ... and close the head again */
+    }
+    if (body) mast_buf_put(body, text, (size_t)n);
 }

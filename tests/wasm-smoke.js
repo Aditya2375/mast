@@ -87,6 +87,91 @@ factory({}).then(m => {
     c = newConn();
     r = send(c, "PUT /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
     ok(statusOf(r) === 405 && r.includes("Allow: GET, HEAD, POST"), "wasm: PUT is 405 with Allow");
+    {
+        /* 405 framing: Allow sits before the blank line, the body matches
+         * Content-Length exactly, and a pipelined request stays aligned */
+        const headEnd = r.indexOf("\r\n\r\n");
+        const head = r.slice(0, headEnd);
+        const cl = parseInt((head.match(/Content-Length: (\d+)/) || [])[1], 10);
+        ok(head.includes("Connection: keep-alive\r\nAllow: GET, HEAD, POST"), "wasm: 405 Allow is inside the head");
+        ok(r.length === headEnd + 4 + cl, "wasm: 405 Content-Length matches the wire body");
+    }
+
+    c = newConn();
+    r = send(c, "PUT /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok((r.match(/HTTP\/1.1 (405|200)/g) || []).length === 2 &&
+       r.indexOf("405") < r.indexOf("hello, world"),
+       "wasm: pipelined request after a 405 stays aligned");
+
+    c = newConn();
+    r = send(c, "HEAD /nope HTTP/1.1\r\nHost: demo\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    {
+        const headEnd = r.indexOf("\r\n\r\n");
+        const head = r.slice(0, headEnd);
+        ok(head.startsWith("HTTP/1.1 404") && /Content-Length: \d+/.test(head),
+           "wasm: HEAD 404 reports a Content-Length");
+        ok(r.slice(headEnd + 4).startsWith("HTTP/1.1 200"),
+           "wasm: HEAD 404 sends no body - the next response follows immediately");
+    }
+
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 100000\r\n\r\n" + "y".repeat(100000));
+    ok(statusOf(r) === 200 && r.endsWith("y".repeat(100)) && r.includes("Content-Length: 100000"),
+       "wasm: a 100 KB body in one call echoes (head cap does not eat the body)");
+
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n");
+    ok(r === "HTTP/1.1 100 Continue\r\n\r\n", "wasm: 100 Continue precedes an accepted body");
+    r = send(c, "hello");
+    ok(statusOf(r) === 200 && r.endsWith("hello"), "wasm: body after 100 Continue echoes");
+
+    c = newConn();
+    r = send(c, "OPTIONS * HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok(statusOf(r) === 204 && r.includes("Allow: GET, HEAD, POST, OPTIONS"), "wasm: OPTIONS * is 204 with Allow");
+
+    c = newConn();
+    r = send(c, "GET http://demo/hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok(statusOf(r) === 200 && r.includes("hello, world"), "wasm: absolute-form serves its path");
+    c = newConn();
+    r = send(c, "GET http://a/hello.txt HTTP/1.1\r\nHost: b\r\n\r\n");
+    ok(statusOf(r) === 400, "wasm: absolute-form disagreeing with Host is 400");
+
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    const etag = (r.match(/ETag: ("[^"]+")/) || [])[1];
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nIf-None-Match: \"nope\", " + etag + "\r\n\r\n");
+    ok(statusOf(r) === 304, "wasm: If-None-Match list matches a member");
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nRange: bytes=0-4\r\nIf-Range: \"stale\"\r\n\r\n");
+    ok(statusOf(r) === 200, "wasm: If-Range with a stale validator serves the full body");
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nRange: bytes=0-4\r\nIf-Range: " + etag + "\r\n\r\n");
+    ok(statusOf(r) === 206, "wasm: If-Range with the current etag serves the range");
+
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nRange: bytes=0-1,3-4\r\n\r\n");
+    ok(statusOf(r) === 200 && r.includes("hello, world"), "wasm: multi-range serves the full body");
+
+    c = newConn();
+    r = send(c, "GET /hello.txt HTTP/1.1\r\nHost: demo\r\nConnection: disclose\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n");
+    ok((r.match(/HTTP\/1.1 200/g) || []).length === 2, "wasm: Connection: disclose does not close");
+
+    c = newConn();
+    r = send(c, "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
+    ok(statusOf(r) === 400, "wasm: duplicate Host is 400");
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: +5\r\n\r\nhello");
+    ok(statusOf(r) === 400, "wasm: Content-Length with a sign is 400");
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    ok(statusOf(r) === 400, "wasm: duplicate Transfer-Encoding is 400");
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n");
+    ok(statusOf(r) === 400, "wasm: malformed chunk framing is 400, not 413");
+    c = newConn();
+    r = send(c, "POST /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\n100001\r\nyyyy");
+    ok(statusOf(r) === 413, "wasm: an over-cap chunk size is 413");
 
     /* the demo page wires the buttons and the cache-busters */
     const html = require("fs").readFileSync(require("path").join(__dirname, "..", "docs", "index.html"), "utf8");

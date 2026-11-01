@@ -1,12 +1,14 @@
 /* handle.c - request to response. Static GET/HEAD with conditionals and
  * ranges, POST /echo for request bodies, and exact error pages for every
- * way a request can be bad. HEAD sends the GET headers with no body. */
+ * way a request can be bad. HEAD sends the GET headers with no body:
+ * Content-Length still says what a GET would have sent (RFC 9110 9.3.2). */
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "handle.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -24,33 +26,56 @@ void mast_response_free(MastResponse *r) {
     r->file.fd = -1;
 }
 
-static void err(MastResponse *r, int status, const char *why, int keep_alive) {
-    mast_reply_error(&r->head, status, why, keep_alive);
+/* An error response: headers in r->head, the text page in r->mem (unless
+ * the request was HEAD - the status line and Content-Length are unchanged,
+ * the body stays home). extra is spliced into the head when set. */
+static void err(MastResponse *r, const MastRequest *req, int status, const char *why,
+                const char *extra) {
+    int ka = req->keep_alive;
+    mast_reply_error(&r->head,
+                     req->method == MAST_METHOD_HEAD ? NULL : &r->mem,
+                     status, why, extra, ka);
     r->status = status;
-    r->close_after = !keep_alive;
+    r->close_after = !ka;
+}
+
+/* If-Range demands strong comparison: the exact entity-tag, or a date at
+ * or after Last-Modified. Anything weaker means "send the whole file". */
+static int if_range_holds(const MastRequest *req, const MastFile *f) {
+    if (!req->if_range) return 1;
+    if (strcmp(req->if_range, f->etag) == 0) return 1;
+    int64_t d = mast_parse_http_date(req->if_range);
+    return d >= 0 && (int64_t)f->st.st_mtime <= d;
 }
 
 void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse *r) {
     int ka = req->keep_alive;
+
+    /* OPTIONS *: the whole server's capabilities (RFC 9110 9.3.7) */
+    if (strcmp(req->method_raw, "OPTIONS") == 0 && strcmp(req->target, "*") == 0) {
+        mast_buf_puts(&r->head, "HTTP/1.1 204 No Content\r\n");
+        char date[MAST_DATE_LEN];
+        mast_http_date(date, (int64_t)time(NULL));
+        mast_buf_printf(&r->head, "Date: %s\r\nServer: mast\r\n"
+                        "Allow: GET, HEAD, POST, OPTIONS\r\n"
+                        "Content-Length: 0\r\nConnection: %s\r\n\r\n",
+                        date, ka ? "keep-alive" : "close");
+        r->status = 204;
+        r->close_after = !ka;
+        return;
+    }
     if (!req->path_ok) {
-        err(r, 400, "the request target is not a safe path", ka);
+        err(r, req, 400, "the request target is not a safe path", NULL);
         return;
     }
     if (req->method == MAST_METHOD_OTHER) {
-        char allow[160];
-        snprintf(allow, sizeof allow, "Allow: GET, HEAD, POST\r\n");
-        mast_reply_error(&r->head, 405, "this server speaks GET, HEAD and POST", ka);
-        /* splice the Allow header before the blank line */
-        r->head.len -= 2;
-        mast_buf_puts(&r->head, allow);
-        mast_buf_puts(&r->head, "\r\n");
-        r->status = 405;
-        r->close_after = !ka;
+        err(r, req, 405, "this server speaks GET, HEAD and POST",
+            "Allow: GET, HEAD, POST\r\n");
         return;
     }
     if (req->method == MAST_METHOD_POST) {
         if (strcmp(req->path, "/echo") != 0) {
-            err(r, 404, "only /echo accepts a body here", ka);
+            err(r, req, 404, "only /echo accepts a body here", NULL);
             return;
         }
         mast_reply_head(&r->head, 200, "OK",
@@ -91,24 +116,22 @@ void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse
         return;
     }
     if (st == 404) {
-        err(r, 404, "nothing lives at this path", ka);
+        err(r, req, 404, "nothing lives at this path", NULL);
         return;
     }
 
     /* 200 or 206 */
     long long size = (long long)r->file.st.st_size;
     long long start = 0, len = size;
-    int range = mast_range_parse(req->range, size, &start, &len);
+    int range = 0;
+    if (if_range_holds(req, &r->file))
+        range = mast_range_parse(req->range, size, &start, &len);
     if (range < 0) {
         close(r->file.fd);
         r->file.fd = -1;
         char cr[96];
-        snprintf(cr, sizeof cr, "bytes */%lld", size);
-        mast_reply_error(&r->head, 416, "that range does not fit this file", ka);
-        r->head.len -= 2;
-        mast_buf_printf(&r->head, "Content-Range: %s\r\n\r\n", cr);
-        r->status = 416;
-        r->close_after = !ka;
+        snprintf(cr, sizeof cr, "Content-Range: bytes */%lld\r\n", size);
+        err(r, req, 416, "that range does not fit this file", cr);
         return;
     }
     int status = range == 1 ? 206 : 200;

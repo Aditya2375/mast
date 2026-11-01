@@ -52,11 +52,14 @@ typedef struct {
     long long content_length;     /* -1 when absent */
     int chunked;                  /* Transfer-Encoding: chunked */
     int expect_continue;          /* Expect: 100-continue */
+    int conn_close, conn_keep_alive;   /* exact Connection tokens seen */
     int keep_alive;               /* resolved: may the connection live on */
     const char *if_none_match;
     const char *if_modified_since;
+    const char *if_range;         /* raw If-Range validator, or NULL */
     const char *range;            /* raw Range header value, or NULL */
     const char *content_type;
+    char authority[256];  /* absolute-form scheme://authority, or "" */
     /* body: filled by the body reader (chunked or length-delimited) */
     char *body;
     size_t body_len, body_cap;
@@ -93,7 +96,12 @@ int mast_sanitize_path(const char *target, char *out, size_t out_cap);
 
 /* A body reader: feeds after the headers complete. Handles both
  * Content-Length and chunked framing, enforcing MAST_MAX_BODY. */
-typedef enum { MAST_BODY_INCOMPLETE, MAST_BODY_OK, MAST_BODY_BAD } MastBodyRead;
+typedef enum {
+    MAST_BODY_INCOMPLETE,   /* need more bytes */
+    MAST_BODY_OK,           /* the body is complete */
+    MAST_BODY_BAD,          /* malformed framing: 400 */
+    MAST_BODY_TOO_LARGE     /* over MAST_MAX_BODY: 413 */
+} MastBodyRead;
 
 /* Incremental body state: content-length copies bytes; chunked decodes
  * HEXSIZE CRLF DATA CRLF ... 0 CRLF trailers CRLF. */
@@ -125,8 +133,12 @@ void mast_buf_printf(MastBuf *b, const char *fmt, ...);
 void mast_reply_head(MastBuf *b, int status, const char *reason,
                      const char *content_type, long long content_length,
                      int keep_alive);
-/* A small plain-text error page with the right status headers. */
-void mast_reply_error(MastBuf *b, int status, const char *why, int keep_alive);
+/* A small plain-text error page: status line + headers go into head, the
+ * body text into body (pass body NULL for HEAD - Content-Length still
+ * reflects the would-be body, per RFC 9110). extra_headers, when not NULL,
+ * is spliced in before the blank line (e.g. "Allow: GET, HEAD, POST\r\n"). */
+void mast_reply_error(MastBuf *head, MastBuf *body, int status, const char *why,
+                      const char *extra_headers, int keep_alive);
 #define MAST_DATE_LEN 40   /* IMF-fixdate is 29 bytes + NUL, with headroom */
 /* RFC 7231 HTTP-date, e.g. for Date / Last-Modified. */
 void mast_http_date(char out[MAST_DATE_LEN], int64_t unix_seconds);
