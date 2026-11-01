@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mast - a small HTTP/1.1 server</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0d1117; color:#c9d1d9; font:15px/1.5 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; }
+  main { max-width:920px; margin:0 auto; padding:2rem 1rem 3rem; }
+  h1 { font-size:1.6rem; margin:0 0 .3rem; color:#d2a8ff; font-family:ui-monospace,monospace; }
+  h1 span { color:#c9d1d9; font-weight:normal; }
+  a { color:#58a6ff; }
+  .sub { color:#8b949e; margin-bottom:1.2rem; }
+  .row { margin:.6rem 0; }
+  select, button { background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; padding:.45rem .8rem; font:13px ui-monospace,monospace; cursor:pointer; }
+  button:hover:not(:disabled) { background:#30363d; }
+  button:disabled { opacity:.45; cursor:default; }
+  textarea { width:100%; box-sizing:border-box; background:#161b22; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; padding:.6rem; font:12.5px ui-monospace,monospace; min-height:150px; }
+  .term { background:#0a0d12; border:1px solid #30363d; border-radius:8px; margin-top:.8rem; }
+  .termbar { padding:.35rem .7rem; color:#8b949e; font:12px ui-monospace,monospace; border-bottom:1px solid #30363d; }
+  #out { padding:.7rem; min-height:220px; max-height:420px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; font:12.5px ui-monospace,monospace; }
+  #out .req { color:#58a6ff; }
+  #out .resp { color:#7ee787; }
+  #out .err { color:#f85149; }
+  #out .meta { color:#8b949e; }
+  .note { color:#8b949e; font-size:12.5px; margin-top:.6rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>mast <span>- a small HTTP/1.1 server</span></h1>
+  <p class="sub">The real server core - the same incremental parser, path
+  sanitizer, range/conditional logic and response builder the epoll server
+  drives over sockets - compiled to WebAssembly, answering against an
+  in-memory filesystem. <a href="https://github.com/Aditya2375/mast">Source on GitHub</a>.</p>
+
+  <div class="row">
+    <select id="preset" disabled></select>
+    <button id="send" disabled>send request</button>
+    <button id="newconn" disabled>new connection</button>
+    <span class="note" id="connlabel"></span>
+  </div>
+  <textarea id="req" spellcheck="false" disabled></textarea>
+  <div class="term">
+    <div class="termbar">raw HTTP - what the server sees and answers</div>
+    <div id="out">loading wasm...</div>
+  </div>
+  <p class="note">The demo docroot has index.html, hello.txt, style.css,
+  data.json, docs/index.html and a 64 KB big.txt. Edit the request freely -
+  the parser is the real one, caps and all. Requests stay on one keep-alive
+  connection until a response says close.</p>
+</main>
+<script src="mast.js?v=87a72181d8f0"></script>
+<script>
+const out = document.getElementById('out');
+const req = document.getElementById('req');
+const preset = document.getElementById('preset');
+const sendBtn = document.getElementById('send');
+const newConnBtn = document.getElementById('newconn');
+const connLabel = document.getElementById('connlabel');
+let M = null;
+let conn = null;
+let connNo = 0;
+
+const presets = {
+  'GET /': 'GET / HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'GET /hello.txt': 'GET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'HEAD /big.txt': 'HEAD /big.txt HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'Range (last 64 bytes)': 'GET /big.txt HTTP/1.1\r\nHost: demo\r\nRange: bytes=-64\r\n\r\n',
+  'GET /docs (redirect)': 'GET /docs HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'POST /echo': 'POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\nhello, mast!',
+  'POST /echo (chunked)': 'POST /echo HTTP/1.1\r\nHost: demo\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7\r\n, mast!\r\n0\r\n\r\n',
+  'pipelined x2': 'GET /hello.txt HTTP/1.1\r\nHost: demo\r\n\r\nGET /data.json HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'HTTP/1.0 (closes)': 'GET /hello.txt HTTP/1.0\r\n\r\n',
+  'traversal attack': 'GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: demo\r\n\r\n',
+  'smuggling attempt': 'POST /echo HTTP/1.1\r\nHost: demo\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n',
+  'bad request': 'GARBAGE\r\n\r\n',
+  'missing file': 'GET /nope HTTP/1.1\r\nHost: demo\r\n\r\n',
+};
+for (const name of Object.keys(presets)) {
+  const o = document.createElement('option');
+  o.value = name;
+  o.textContent = name;
+  preset.appendChild(o);
+}
+preset.addEventListener('change', () => { req.value = presets[preset.value]; });
+
+/* One DOM flush per response: decode bytes non-fatally (U+FFFD), show the
+   request in blue, the response in green, meta lines in gray. */
+const td = new TextDecoder('utf-8');
+function line(t, cls){
+  const s = document.createElement('span');
+  s.className = cls;
+  s.textContent = t;
+  out.appendChild(s);
+  out.scrollTop = out.scrollHeight;
+}
+function show(bytes){ return td.decode(bytes).replace(/\r/g, '\\r'); }
+
+function newConn(){
+  if (conn) M.ccall('mast_conn_free', null, ['number'], [conn]);
+  conn = M.ccall('mast_conn_new', 'number', [], []);
+  connNo++;
+  connLabel.textContent = 'connection #' + connNo;
+  return conn;
+}
+
+function send(){
+  const text = req.value;
+  const bytes = new TextEncoder().encode(text);
+  const ptr = M._malloc(Math.max(bytes.length, 1));
+  if (!ptr) { line('mast: out of memory sending the request\n', 'err'); return; }
+  M.writeArrayToMemory(bytes, ptr);
+  if (!conn || M.ccall('mast_conn_closed', 'number', ['number'], [conn])) {
+    newConn();
+    line('-- new connection #' + connNo + ' --\n', 'meta');
+  }
+  line('>> ' + show(bytes) + '\n\n', 'req');
+  try {
+    M.ccall('mast_recv', 'number', ['number', 'number', 'number'], [conn, ptr, bytes.length]);
+  } catch (e) {
+    M._free(ptr);
+    line('mast: the interpreter threw (' + (e && e.message ? e.message : e) + ') - starting a new connection\n', 'err');
+    newConn();
+    return;
+  }
+  M._free(ptr);
+  const len = M.ccall('mast_out_len', 'number', ['number'], [conn]);
+  const optr = M.ccall('mast_out_ptr', 'number', ['number'], [conn]);
+  const resp = M.HEAPU8.slice(optr, optr + len);
+  M.ccall('mast_out_drain', null, ['number'], [conn]);
+  line('<< ' + show(resp) + '\n', 'resp');
+  if (M.ccall('mast_conn_closed', 'number', ['number'], [conn])) {
+    line('-- the server closed the connection --\n', 'meta');
+  }
+}
+
+sendBtn.addEventListener('click', send);
+newConnBtn.addEventListener('click', () => { newConn(); line('-- new connection #' + connNo + ' --\n', 'meta'); });
+
+MastModule({ locateFile: (path) => path + '?v=87a72181d8f0' }).then(m => {
+  M = m;
+  M.ccall('mast_boot', null, [], []);
+  newConn();
+  out.textContent = '';
+  line('mast demo ready - the real C server core answers below.\n', 'meta');
+  preset.disabled = false;
+  sendBtn.disabled = false;
+  newConnBtn.disabled = false;
+  req.disabled = false;
+  req.value = presets['GET /'];
+}).catch(e => {
+  out.textContent = '';
+  line('mast: could not start the demo (' + (e && e.message ? e.message : e) + ')\n', 'err');
+  line('reload the page to try again\n', 'err');
+});
+</script>
+</body>
+</html>

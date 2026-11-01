@@ -1,0 +1,45 @@
+name: test
+on: [push, pull_request]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make build/test-unit
+      - run: ./build/test-unit
+  sockets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make && sh tests/run-tests.sh && sh tests/check-docs.sh
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make sanitize
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make build/test-fuzz
+      - name: mutated + random blobs (several seeds)
+        run: |
+          for seed in 1 2 3 4 5 6 7 8 20261101; do
+            python3 tests/fuzz.py --programs 100 --blobs 60 --seed "$seed"
+          done
+      - name: fuzz under sanitizers
+        run: |
+          make clean
+          make EXTRA="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" build/test-fuzz
+          UBSAN_OPTIONS=halt_on_error=1 python3 tests/fuzz.py --programs 50 --blobs 300
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.13
+      - run: sh wasm/build.sh
+      - run: node tests/wasm-smoke.js
+      - name: committed demo matches a fresh build
+        run: git diff --exit-code --stat docs/
