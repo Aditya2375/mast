@@ -4,7 +4,7 @@ mast is a small HTTP/1.1 server written in C11 plus Linux/POSIX
 (epoll, sendfile, realpath), with no dependencies beyond libc. It serves
 static files with keep-alive, pipelining, range requests, conditional
 requests and chunked request bodies, and it echoes POSTs. The server core is
-2540 lines of C.
+2549 lines of C.
 
 Try it in your browser: **https://aditya2375.github.io/mast/** - the same
 parser, path sanitizer and response builder compiled to WebAssembly,
@@ -29,7 +29,7 @@ to retune the header, idle, body and write timeouts in milliseconds,
 total budget for dynamic connection buffers - parse backlog, request
 bodies and response pages (default 256; pressure earns the offending
 connection a clean 503, never a process crash). The fixed per-connection
-struct (about 40 KB times `-c` connections) and the static file buffers
+struct (about 49 KB times `-c` connections) and the static file buffers
 are not charged against it.
 
 ## What it does
@@ -192,8 +192,9 @@ the request:
   interim included, and an echo's response copy projected at its
   buffer-doubling target before the body is accepted. A connection that would push past it
   gets a 503 with Retry-After: 1 and closes. The fixed Conn struct
-  (about 40 KB per connection, so `-c 1024` carries roughly 40 MB
-  whether the budget is reached or not) and the static file buffers are
+  (about 49 KB per connection - the request, response,
+  body-reader and parser structs alone are 49144 bytes, so `-c 1024`
+  carries roughly 50 MB whether the budget is reached or not) and the static file buffers are
   separate. A malloc failure inside the budget means the host itself is
   out of memory, which no static server survives usefully - mast exits
   70 then.

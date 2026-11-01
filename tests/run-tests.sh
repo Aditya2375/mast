@@ -238,7 +238,8 @@ pb.close()
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n\r\n")
 etag = re.search(rb'ETag: ("[^"]+")', r).group(1)
 r = request(b"GET /a.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: " + etag + b"\r\n\r\n")
-ok(status(r) == 304, "If-None-Match short-circuits")
+ok(status(r) == 304 and b"ETag:" in r and b"Last-Modified:" in r,
+   "If-None-Match short-circuits with the 200's validators (RFC 9110 15.4.5)")
 
 # errors and abuse
 r = request(b"GARBAGE\r\n\r\n")

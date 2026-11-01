@@ -43,5 +43,28 @@ printf '%s' "$pins" | while IFS='|' read -r file src_pat doc_pat; do
         echo "check-docs: README does not document: $doc_pat"; exit 1
     fi
 done || fail=1
+# Pin the documented fixed per-connection size to the structs that make
+# it up: compile a sizeof probe and grep the README for its answer.
+szsrc=$(mktemp /tmp/mast-sizes-XXXXXX.c)
+szbin=$(mktemp /tmp/mast-sizes-XXXXXX)
+cat > "$szsrc" <<'EOF'
+#include "http.h"
+#include "handle.h"
+#include <stdio.h>
+int main(void) {
+    printf("%zu\n", sizeof(MastRequest) + sizeof(MastResponse) +
+           sizeof(MastBodyReader) + sizeof(MastParser));
+    return 0;
+}
+EOF
+if ${CC:-cc} -I src -O2 -o "$szbin" "$szsrc" 2>/dev/null; then
+    perconn=$("$szbin")
+    if ! grep -q -- "$perconn bytes" README.md; then
+        echo "check-docs: README per-connection size stale (structs now $perconn bytes)"; fail=1
+    fi
+else
+    echo "check-docs: could not compile the per-connection sizeof probe"; fail=1
+fi
+rm -f "$szsrc" "$szbin"
 [ "$fail" -eq 0 ] && echo "check-docs: ok"
 exit $fail

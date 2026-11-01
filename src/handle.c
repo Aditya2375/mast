@@ -127,8 +127,11 @@ void mast_respond(const MastRequest *req, const char *docroot_real, MastResponse
         mast_buf_printf(&r->head, "HTTP/1.1 304 Not Modified\r\n");
         char date[MAST_DATE_LEN];
         mast_http_date(date, (int64_t)time(NULL));
-        mast_buf_printf(&r->head, "Date: %s\r\nServer: mast\r\nETag: %s\r\nConnection: %s\r\n\r\n",
-                        date, r->file.etag, ka ? "keep-alive" : "close");
+        /* RFC 9110 15.4.5: a 304 repeats the metadata its 200 would send */
+        mast_buf_printf(&r->head, "Date: %s\r\nServer: mast\r\nETag: %s\r\n"
+                        "Last-Modified: %s\r\nConnection: %s\r\n\r\n",
+                        date, r->file.etag, r->file.last_modified,
+                        ka ? "keep-alive" : "close");
         r->status = 304;
         r->close_after = !ka;
         return;

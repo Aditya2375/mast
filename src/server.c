@@ -42,6 +42,7 @@ typedef enum {
 #define SHUTDOWN_GRACE_MS 5000   /* in-flight writes get this, then exit */
 
 static int g_drainers = 0;
+static int g_listener_tag;   /* epoll data.ptr sentinel: never a Conn* */
 
 /* Total bytes held in per-connection dynamic buffers (parse backlog,
  * request bodies and response heads/pages). Bounded by the -M budget: a
@@ -648,7 +649,7 @@ int mast_serve(const MastConfig *cfg) {
     struct epoll_event lev;
     memset(&lev, 0, sizeof lev);
     lev.events = EPOLLIN | EPOLLET;
-    lev.data.fd = lfd;
+    lev.data.ptr = &g_listener_tag;
     if (epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &lev) < 0) { perror("epoll_ctl"); return 1; }
 
     const int slots = cfg->max_conn + OVERFLOW_SLOTS;
@@ -670,8 +671,9 @@ int mast_serve(const MastConfig *cfg) {
             break;
         }
         for (int i = 0; i < nev; i++) {
-            int fd = evs[i].data.fd;
-            if (fd == lfd) {
+            /* connection events carry the Conn in data.ptr; the listener
+             * is the one event whose ptr is the sentinel instead */
+            if (evs[i].data.ptr == &g_listener_tag) {
                 if (g_stop) continue;
                 for (;;) {
                     struct sockaddr_in peer;
@@ -720,8 +722,12 @@ int mast_serve(const MastConfig *cfg) {
                                 noverflow++;
                                 continue;
                             }
+                            /* conn_free owned cfd and closed it: nothing
+                             * is left to write to, so do not fall through
+                             * to the best-effort send on a closed fd */
                             conn_free(c);
                             free(c);
+                            continue;
                         } else if (c) {
                             free(c);
                         }
@@ -905,7 +911,7 @@ int mast_serve(const MastConfig *cfg) {
     close(ep);
     /* the grace-cap break can leave connections open; the process is
      * exiting, but close them cleanly anyway */
-    for (int k = 0; k < cfg->max_conn; k++) {
+    for (int k = 0; k < slots; k++) {
         if (conns[k]) { conn_free(conns[k]); free(conns[k]); }
     }
     free(conns);

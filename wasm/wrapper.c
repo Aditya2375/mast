@@ -91,7 +91,14 @@ static void emit_response(DemoConn *c, MastResponse *r) {
         while (left > 0) {
             size_t want = left > (long long)sizeof chunk ? sizeof chunk : (size_t)left;
             ssize_t got = pread(r->file.fd, chunk, want, (off_t)off);
-            if (got <= 0) break;
+            if (got <= 0) {
+                /* the file shrank mid-transfer: the socket server treats
+                 * that as fatal and closes (conn_flush "truncated
+                 * mid-transfer") - never emit fewer bytes than the head
+                 * promised and carry on as if nothing happened */
+                c->closed = 1;
+                break;
+            }
             mast_buf_put(&c->out, chunk, (size_t)got);
             left -= got;
             off += got;

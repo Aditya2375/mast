@@ -28,7 +28,7 @@ static void usage(FILE *f) {
         "  -A age-ms           max connection age (default: 300000)\n"
         "  -M megabytes        total budget for dynamic connection buffers: parse\n"
         "                          backlog, request bodies, response pages (default: 256).\n"
-        "                          The fixed per-connection struct overhead (about 40 KB\n"
+        "                          The fixed per-connection struct overhead (about 49 KB\n"
         "                          times -c connections) and static file buffers are not\n"
         "                          charged against it.\n");
 }
