@@ -1,0 +1,3 @@
+# mast
+Educational C HTTP/1.1 server and browser-local WebAssembly demonstration. Browser demo excludes real sockets, TLS, and native connection timeouts. No production security guarantee.
+Source: https://github.com/Aditya2375/mast
