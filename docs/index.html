@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Educational C HTTP/1.1 server lab: test a local WebAssembly parser and response builder against an in-memory filesystem. No real requests leave this page.">
+<meta name="theme-color" content="#0d1117"><meta name="referrer" content="no-referrer"><link rel="canonical" href="https://aditya2375.github.io/mast/">
+<meta property="og:title" content="mast / HTTP server lab"><meta property="og:description" content="Educational C HTTP/1.1 parser running locally in WebAssembly."><meta property="og:type" content="website"><meta property="og:url" content="https://aditya2375.github.io/mast/">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>mast - a small HTTP/1.1 server</title>
 <style>
   :root { color-scheme: dark; }
@@ -24,6 +28,7 @@
   #out .resp { color:#7ee787; }
   #out .err { color:#f85149; }
   #out .meta { color:#8b949e; }
+  select { max-width:100%; } button,select { min-height:44px; } :focus-visible { outline:2px solid #58a6ff;outline-offset:3px; }
   .note { color:#8b949e; font-size:12.5px; margin-top:.6rem; }
 </style>
 </head>
@@ -36,20 +41,21 @@
   in-memory filesystem. <a href="https://github.com/Aditya2375/mast">Source on GitHub</a>.</p>
 
   <div class="row">
-    <select id="preset" disabled></select>
+    <select aria-label="Request preset" id="preset" disabled></select>
     <button id="send" disabled>send request</button>
     <button id="newconn" disabled>new connection</button>
     <span class="note" id="connlabel"></span>
   </div>
-  <textarea id="req" spellcheck="false" disabled></textarea>
+  <textarea aria-label="Raw HTTP request" maxlength="1100000" id="req" spellcheck="false" disabled></textarea>
   <div class="term">
     <div class="termbar">raw HTTP - what the server sees and answers</div>
-    <div id="out">loading wasm...</div>
+    <div id="out" role="log" aria-live="polite">loading wasm...</div>
   </div>
   <p class="note">The demo docroot has index.html, hello.txt, style.css,
   data.json, docs/index.html and a 64 KB big.txt. Edit the request freely -
   the parser is the real one, caps and all. Requests stay on one keep-alive
-  connection until a response says close.</p>
+  connection until a response says close. Browser-only simulation: no live sockets, socket timeouts, TLS or real network request. Responses may be truncated. Request text is limited to 1,100,000 characters, wire bytes to 1,100,000, and transcript to 120 spans.</p>
+  <p class="note">Educational, unaudited server, not production hosting software. <a href="https://github.com/Aditya2375/mast/issues">Report an issue</a>.</p>
 </main>
 <script src="mast.js?v=3cac4ba54291"></script>
 <script>
@@ -99,6 +105,7 @@ function line(t, cls){
   s.className = cls;
   s.textContent = t;
   out.appendChild(s);
+  while (out.children.length > 120) out.firstElementChild.remove();
   out.scrollTop = out.scrollHeight;
 }
 function show(bytes){ return td.decode(bytes).replace(/\r/g, '\\r'); }
@@ -106,6 +113,7 @@ function show(bytes){ return td.decode(bytes).replace(/\r/g, '\\r'); }
 function newConn(){
   if (conn) M.ccall('mast_conn_free', null, ['number'], [conn]);
   conn = M.ccall('mast_conn_new', 'number', [], []);
+  if (!conn) throw new Error('Could not allocate a demo connection');
   connNo++;
   connLabel.textContent = 'connection #' + connNo;
   return conn;
@@ -116,6 +124,7 @@ function send(){
      bytes are real HTTP (and the display shows what the server sees) */
   const wire = req.value.replace(/\r?\n/g, '\r\n');
   const bytes = new TextEncoder().encode(wire);
+  if (bytes.length > 1100000) { line("mast: request exceeds the 1,100,000-byte browser limit\n", "err"); return; }
   const ptr = M._malloc(Math.max(bytes.length, 1));
   if (!ptr) { line('mast: out of memory sending the request\n', 'err'); return; }
   M.writeArrayToMemory(bytes, ptr);
