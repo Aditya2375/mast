@@ -918,6 +918,14 @@ int main(void) {
         const char *html2 = "<h1>HI</h1>\n";   /* same 12 bytes */
         ssize_t w = write(fd, html2, strlen(html2));
         (void)w;
+        /* Pin a distinct sub-second mtime instead of assuming the host
+         * filesystem clock advances between two immediate writes. */
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            struct timespec ts[2] = {st.st_atim, st.st_mtim};
+            ts[1].tv_nsec = (ts[1].tv_nsec + 1) % 1000000000L;
+            if (futimens(fd, ts) != 0) { perror("futimens"); exit(1); }
+        }
         close(fd);
         RESPOND("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         CHECK(strcmp(rs.file.etag, first_etag) != 0,
