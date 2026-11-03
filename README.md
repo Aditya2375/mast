@@ -317,3 +317,7 @@ wasm/                       browser demo wrapper (emscripten)
 tests/                      unit, live-socket, fuzz and docs suites
 docs/                       the wasm demo page (GitHub Pages)
 ```
+
+## Browser and security boundaries
+
+Educational, unaudited server code. The WebAssembly page is a socket-free parser/response simulation, not a production hosting service. It cannot demonstrate TLS, slow-client timeouts or native socket limits. Input is limited to 1,100,000 characters and 1,100,000 wire bytes; the transcript retains at most 120 spans. No request content is sent to a remote server. Generated responses may be truncated. Source is public; do not paste secrets into examples. GitHub Pages cannot set project-specific response headers; this demo uses a meta CSP, with inline script/style allowances for its existing single-file design.
