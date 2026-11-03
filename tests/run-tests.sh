@@ -106,7 +106,11 @@ def request(raw, read_all=True, shutdown=True, to=port):
     s = socket.create_connection(("127.0.0.1", to), timeout=3)
     s.sendall(raw)
     if shutdown:
-        s.shutdown(socket.SHUT_WR)
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except OSError as e:
+            if e.errno not in (107, 104): raise
+            last_reset = True
     out = b""
     while True:
         try:
